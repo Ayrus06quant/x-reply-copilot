@@ -1,0 +1,169 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #0f1419;
+  color: #e7e9ea;
+  line-height: 1.5;
+}
+
+.container {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+
+header h1 {
+  margin: 0 0 4px;
+  font-size: 28px;
+}
+
+.subtitle {
+  color: #71767b;
+  margin: 0 0 32px;
+}
+
+section {
+  margin-bottom: 32px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid #2f3336;
+}
+
+h2 {
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+
+h3 {
+  font-size: 15px;
+  margin: 0 0 8px;
+}
+
+.hint {
+  color: #71767b;
+  font-size: 13px;
+  margin: 0 0 12px;
+}
+
+.disclosure {
+  background: rgba(29, 155, 240, 0.08);
+  border: 1px solid rgba(29, 155, 240, 0.3);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.disclosure h2 {
+  color: #1d9bf0;
+}
+
+.input {
+  display: block;
+  width: 100%;
+  padding: 10px 12px;
+  background: #16181c;
+  border: 1px solid #2f3336;
+  border-radius: 8px;
+  color: #e7e9ea;
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+
+.input.narrow {
+  width: 100px;
+}
+
+label {
+  display: block;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: #71767b;
+}
+
+select {
+  display: block;
+  margin-top: 4px;
+  padding: 8px;
+  background: #16181c;
+  border: 1px solid #2f3336;
+  border-radius: 8px;
+  color: #e7e9ea;
+}
+
+.checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: #e7e9ea;
+  cursor: pointer;
+}
+
+.btn {
+  padding: 10px 20px;
+  border-radius: 999px;
+  border: none;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-right: 8px;
+}
+
+.btn.primary {
+  background: #1d9bf0;
+  color: #fff;
+}
+
+.btn.secondary {
+  background: #16181c;
+  color: #e7e9ea;
+  border: 1px solid #2f3336;
+}
+
+.status {
+  font-size: 13px;
+  margin-left: 8px;
+}
+
+.status.ok { color: #00ba7c; }
+.status.err { color: #f4212e; }
+
+.style-card {
+  background: #16181c;
+  border: 1px solid #2f3336;
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.style-card ul {
+  margin: 0 0 12px;
+  padding-left: 20px;
+}
+
+.style-card li {
+  margin-bottom: 4px;
+  font-size: 14px;
+}
+
+.shortcuts {
+  padding-left: 20px;
+}
+
+kbd {
+  background: #16181c;
+  border: 1px solid #2f3336;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 12px;
+}
+
+a {
+  color: #1d9bf0;
+}
+
+footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}

@@ -1,0 +1,16 @@
+node_modules
+.output
+.wxt
+dist
+*.zip
+.env
+.env.*
+
+# OS / editor / logs
+*.log
+npm-debug.log*
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+*.swp
