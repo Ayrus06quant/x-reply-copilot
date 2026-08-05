@@ -1,4 +1,4 @@
-import type { ComprehendResult, ComposeRequest, PostBrief } from './types';
+import type { ComprehendResult, ComposeRequest, MediaItem, PostBrief } from './types';
 import type { ApiKeyValidation } from './api-validation';
 import {
   buildComprehendPrompt,
@@ -13,6 +13,14 @@ import {
   recordGenerationRecovery,
   RAW_PREVIEW_CHARS,
 } from './debug';
+import {
+  combineMediaDescriptions,
+  fallbackDescriptionForMedia,
+  MEDIA_UNREADABLE,
+  selectMediaForDescription,
+  visionPromptForMedia,
+} from './media';
+import { postBriefHasVisualMedia } from './post-brief';
 
 /** Preference order when multiple flash models are available (newest/cheapest first). */
 export const GEMINI_MODELS = [
@@ -153,6 +161,8 @@ function parseGeminiError(status: number, body: string): string {
 }
 
 const FETCH_TIMEOUT_MS = 25_000;
+/** Abandon further model/route fallbacks once this wall clock is exceeded (§5.4). */
+export const COMPOSE_WALL_CLOCK_MS = 8_000;
 
 const DEFAULT_MAX_TOKENS = 2048;
 /** Five drafts plus JSON scaffolding, with headroom for any thinking the API still does. */
@@ -253,18 +263,34 @@ async function loadGeminiPrefs(): Promise<{ model?: string; authMode?: GeminiAut
 }
 
 async function persistGeminiPrefs(model: string, authMode: GeminiAuthMode): Promise<void> {
+  const current = await loadGeminiPrefs();
+  if (current.model === model && current.authMode === authMode) return;
   await chrome.storage.local.set({ preferredGeminiModel: model, geminiAuthMode: authMode });
   console.info(`[Gemini] persisted model=${model} authMode=${authMode}`);
 }
 
+/** Cold workers must not pay ListModels on every wake when a fresh list is already stored. */
+export const DISCOVERED_MODELS_TTL_MS = 24 * 60 * 60 * 1000;
+
 async function persistDiscoveredModels(models: string[]): Promise<void> {
-  await chrome.storage.local.set({ discoveredGeminiModels: models });
+  await chrome.storage.local.set({
+    discoveredGeminiModels: models,
+    discoveredGeminiModelsAt: Date.now(),
+  });
 }
 
-async function loadStoredDiscoveredModels(): Promise<string[]> {
-  const result = await chrome.storage.local.get(['discoveredGeminiModels']);
+async function loadStoredDiscoveredModels(): Promise<{ models: string[]; at: number } | null> {
+  const result = await chrome.storage.local.get([
+    'discoveredGeminiModels',
+    'discoveredGeminiModelsAt',
+  ]);
   const stored = result.discoveredGeminiModels;
-  return Array.isArray(stored) ? (stored as string[]) : [];
+  if (!Array.isArray(stored) || stored.length === 0) return null;
+  const at =
+    typeof result.discoveredGeminiModelsAt === 'number'
+      ? result.discoveredGeminiModelsAt
+      : 0;
+  return { models: stored as string[], at };
 }
 
 /** Try auth modes until one succeeds or all are exhausted. */
@@ -455,9 +481,15 @@ function generateContentThinkingConfig(model: string): Record<string, unknown> |
   return /gemini-2\.5/.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : null;
 }
 
-/** Budget to fall back to when the API rejects thinking controls and thoughts stay enabled. */
-function inflatedTokenBudget(maxTokens: number): number {
-  return Math.min(Math.max(maxTokens * 4, 4096), 16_384);
+/**
+ * Budget when the API rejects thinking controls. Previously inflated to 16384, which
+ * turned the fallback into unbounded thinking. Cap is a small headroom only.
+ */
+export const CONFIG_REJECTION_TOKEN_CEILING = 5120;
+
+/** @internal exported for Wave 2 harness verification */
+export function inflatedTokenBudget(maxTokens: number): number {
+  return Math.min(maxTokens + 512, CONFIG_REJECTION_TOKEN_CEILING);
 }
 
 function isConfigRejection(err: GeminiCallError): boolean {
@@ -563,15 +595,16 @@ async function callGeminiInteractions(
     const err = e as GeminiCallError;
     if (!isConfigRejection(err)) throw err;
 
-    // Thinking controls rejected: give the answer room to survive alongside the thoughts.
+    const fallbackTokens = inflatedTokenBudget(maxTokens);
     console.warn(
-      `[Gemini] thinking control rejected for ${model}; retrying with a larger token budget`,
+      `[Gemini] thinking control rejected for ${model} on interactions; ` +
+        `retrying without thinking fields at max_output_tokens=${fallbackTokens}`,
     );
     return postInteractions(
       apiKey,
       model,
       parts,
-      inflatedTokenBudget(maxTokens),
+      fallbackTokens,
       jsonMode,
       false,
       preferredAuth,
@@ -678,11 +711,16 @@ async function callGeminiGenerateContent(
   } catch (e) {
     const err = e as GeminiCallError;
     if (!isConfigRejection(err)) throw err;
+    const fallbackTokens = inflatedTokenBudget(maxTokens);
+    console.warn(
+      `[Gemini] thinking control rejected for ${model} on generateContent; ` +
+        `retrying without thinking fields at maxOutputTokens=${fallbackTokens}`,
+    );
     return postGenerateContent(
       apiKey,
       model,
       resolvedParts,
-      inflatedTokenBudget(maxTokens),
+      fallbackTokens,
       jsonMode,
       false,
       preferredAuth,
@@ -804,14 +842,20 @@ async function resolveModelOrder(apiKey: string): Promise<string[]> {
 
   const stored = await loadStoredDiscoveredModels();
   const prefs = await loadGeminiPrefs();
-  let discovered = await listAvailableFlashModels(apiKey);
+  const cacheFresh =
+    stored != null && Date.now() - stored.at < DISCOVERED_MODELS_TTL_MS;
 
-  if (discovered.length === 0 && stored.length > 0) {
-    discovered = sortModelsByPreference(stored);
-  }
-
-  if (discovered.length > 0) {
-    await persistDiscoveredModels(discovered);
+  let discovered: string[];
+  if (cacheFresh) {
+    discovered = sortModelsByPreference(stored.models);
+  } else {
+    discovered = await listAvailableFlashModels(apiKey);
+    if (discovered.length === 0 && stored != null) {
+      discovered = sortModelsByPreference(stored.models);
+    }
+    if (discovered.length > 0) {
+      await persistDiscoveredModels(discovered);
+    }
   }
 
   const order =
@@ -863,6 +907,7 @@ async function callGemini(
   maxTokens = DEFAULT_MAX_TOKENS,
   jsonMode = true,
 ): Promise<GenerationResult> {
+  const deadline = Date.now() + COMPOSE_WALL_CLOCK_MS;
   const discovered = await resolveModelOrder(apiKey);
   const models = [
     ...(discovered.includes(activeModel) ? [activeModel] : []),
@@ -873,6 +918,12 @@ async function callGemini(
   let lastError: GeminiCallError | null = null;
 
   for (const model of models) {
+    if (Date.now() > deadline) {
+      throw new Error(
+        `Compose wall-clock budget (${COMPOSE_WALL_CLOCK_MS}ms) exceeded before trying ${model}. ` +
+          (lastError ? formatLastError(lastError, discovered) : 'No model response yet.'),
+      );
+    }
     try {
       const result = await callGeminiModel(apiKey, model, parts, maxTokens, jsonMode);
       activeModel = model;
@@ -1004,77 +1055,72 @@ async function fetchImageAsBase64(url: string): Promise<{ mimeType: string; data
   }
 }
 
-/** Stage 1: multimodal comprehend — cached by tweet ID in session storage. */
-export async function comprehendPost(apiKey: string, postBrief: PostBrief): Promise<ComprehendResult> {
-  let imageDescription = '';
+async function describeOneMediaItem(apiKey: string, item: MediaItem): Promise<string> {
+  if (item.altText) {
+    mediaDebug('using alt text for media', { type: item.type, altLen: item.altText.length });
+    return item.altText;
+  }
+  if (!item.url) return fallbackDescriptionForMedia(item);
 
-  const photo = postBrief.media.find((m) => m.type === 'photo' || m.type === 'animated_gif');
-  if (photo?.altText) {
-    imageDescription = photo.altText;
-    mediaDebug('using alt text for image', { tweetId: postBrief.tweetId, altLen: photo.altText.length });
-  } else if (photo?.url) {
-    const describePrompt =
-      'Describe this image in one sentence for reply context. Output plain text only.';
-    const parts: GeminiPart[] = [
-      { text: describePrompt },
-      { imageUri: photo.url, imageMimeType: 'image/webp' },
-    ];
+  const describePrompt = visionPromptForMedia(item);
+  mediaDebug('vision describe via interactions/generateContent', {
+    type: item.type,
+    url: item.url,
+  });
 
-    mediaDebug('vision describe via interactions/generateContent', {
-      tweetId: postBrief.tweetId,
-      url: photo.url,
-    });
-
+  try {
+    return (
+      await callGemini(
+        apiKey,
+        [{ text: describePrompt }, { imageUri: item.url, imageMimeType: 'image/webp' }],
+        VISION_MAX_TOKENS,
+        false,
+      )
+    ).text.trim();
+  } catch (e) {
+    mediaDebug('vision via URI failed, trying inline fetch', e);
+    const imageData = await fetchImageAsBase64(item.url);
+    if (!imageData) return fallbackDescriptionForMedia(item);
     try {
-      imageDescription = (await callGemini(apiKey, parts, VISION_MAX_TOKENS, false)).text;
-    } catch (e) {
-      mediaDebug('vision via URI failed, trying inline fetch', e);
-      const imageData = await fetchImageAsBase64(photo.url);
-      if (imageData) {
-        try {
-          imageDescription = (
-            await callGemini(
-              apiKey,
-              [{ text: describePrompt }, { inlineData: imageData }],
-              VISION_MAX_TOKENS,
-              false,
-            )
-          ).text;
-        } catch (inlineErr) {
-          mediaDebug('vision via inline fetch failed', inlineErr);
-          imageDescription = '';
-        }
-      }
+      return (
+        await callGemini(
+          apiKey,
+          [{ text: describePrompt }, { inlineData: imageData }],
+          VISION_MAX_TOKENS,
+          false,
+        )
+      ).text.trim();
+    } catch (inlineErr) {
+      mediaDebug('vision via inline fetch failed', inlineErr);
+      return fallbackDescriptionForMedia(item);
     }
   }
+}
 
-  const video = postBrief.media.find((m) => m.type === 'video');
-  if (!imageDescription && video) {
-    if (video.altText) {
-      imageDescription = video.altText;
-    } else if (video.url) {
-      try {
-        imageDescription = (
-          await callGemini(
-            apiKey,
-            [
-              { text: 'Describe this video thumbnail in one sentence for reply context. Output plain text only.' },
-              { imageUri: video.url, imageMimeType: 'image/webp' },
-            ],
-            VISION_MAX_TOKENS,
-            false,
-          )
-        ).text;
-      } catch {
-        imageDescription = 'Video post (poster frame only)';
-      }
-    } else {
-      imageDescription = 'Video post (poster frame only)';
-    }
+/** Stage 1: multimodal comprehend — cached by tweet ID in session storage. */
+export async function comprehendPost(apiKey: string, postBrief: PostBrief): Promise<ComprehendResult> {
+  const totalVisual = postBrief.media.filter(
+    (m) => m.type === 'photo' || m.type === 'video' || m.type === 'animated_gif',
+  ).length;
+  const toDescribe = selectMediaForDescription(postBrief.media);
+  // Parallel vision calls — serialising up to 4 images would dominate the compose budget.
+  const described = await Promise.all(
+    toDescribe.map(async (item, index) => {
+      const text = await describeOneMediaItem(apiKey, item);
+      return text ? { index, text } : null;
+    }),
+  );
+  const perItem = described.filter((d): d is { index: number; text: string } => d != null);
+
+  let imageDescription = combineMediaDescriptions(perItem, totalVisual);
+  if (!imageDescription && postBriefHasVisualMedia(postBrief)) {
+    imageDescription = MEDIA_UNREADABLE;
   }
 
   mediaDebug('comprehend imageDescription', {
     tweetId: postBrief.tweetId,
+    mediaCount: totalVisual,
+    described: perItem.length,
     len: imageDescription.length,
     preview: imageDescription.slice(0, 80),
   });
@@ -1107,6 +1153,8 @@ export async function comprehendPost(apiKey: string, postBrief: PostBrief): Prom
       : postBrief.topReplies.slice(0, 6).map((r) => r.text.slice(0, 80)),
     tweetId: postBrief.tweetId,
     cachedAt: Date.now(),
+    // F10: do not let a parse-failure fallback poison the session cache.
+    degraded: !parsed,
   };
 }
 

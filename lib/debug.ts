@@ -5,10 +5,15 @@ const MEDIA_DEBUG_KEY = 'xrc_debug_media';
 const storageFlags: Record<string, boolean> = {};
 
 try {
-  void chrome.storage?.local?.get([HARVEST_DEBUG_KEY, MEDIA_DEBUG_KEY]).then((result) => {
-    storageFlags[HARVEST_DEBUG_KEY] = result[HARVEST_DEBUG_KEY] === true;
-    storageFlags[MEDIA_DEBUG_KEY] = result[MEDIA_DEBUG_KEY] === true;
-  });
+  chrome.storage?.local
+    ?.get([HARVEST_DEBUG_KEY, MEDIA_DEBUG_KEY])
+    .then((result) => {
+      storageFlags[HARVEST_DEBUG_KEY] = result[HARVEST_DEBUG_KEY] === true;
+      storageFlags[MEDIA_DEBUG_KEY] = result[MEDIA_DEBUG_KEY] === true;
+    })
+    .catch(() => {
+      /* page realm has no chrome.storage — debug flags fall back to localStorage */
+    });
 } catch {
   /* not in an extension context */
 }
@@ -81,7 +86,9 @@ export interface GenerationDebugRecord {
 export function recordGenerationFailure(record: GenerationDebugRecord): void {
   console.error('[XRC Generation] FAILED', record);
   try {
-    void chrome.storage?.local?.set({ [LAST_GENERATION_DEBUG_KEY]: record });
+    chrome.storage?.local
+      ?.set({ [LAST_GENERATION_DEBUG_KEY]: record })
+      .catch((e: unknown) => console.warn('[XRC Generation] could not persist record', e));
   } catch {
     /* storage unavailable — console log already emitted */
   }
@@ -91,7 +98,9 @@ export function recordGenerationFailure(record: GenerationDebugRecord): void {
 export function recordGenerationRecovery(record: GenerationDebugRecord): void {
   console.warn('[XRC Generation] recovered via fallback parsing', record);
   try {
-    void chrome.storage?.local?.set({ [LAST_GENERATION_DEBUG_KEY]: record });
+    chrome.storage?.local
+      ?.set({ [LAST_GENERATION_DEBUG_KEY]: record })
+      .catch((e: unknown) => console.warn('[XRC Generation] could not persist record', e));
   } catch {
     /* ignore */
   }

@@ -1,3 +1,5 @@
+import type { PipelineTiming } from './perf';
+
 /** Slim post context extracted from GraphQL — kept small for postMessage. */
 export interface PostBrief {
   tweetId: string;
@@ -8,6 +10,11 @@ export interface PostBrief {
   media: MediaItem[];
   topReplies: ReplySnippet[];
   url?: string;
+  /**
+   * Which path produced this brief. P6 requires degradation to the DOM scrape to be
+   * visible, so nobody mistakes a thin brief for a model-quality problem again.
+   */
+  source?: 'graphql' | 'dom';
 }
 
 export interface MediaItem {
@@ -90,6 +97,8 @@ export interface ComprehendResult {
   repliesAlreadySaid: string[];
   tweetId: string;
   cachedAt: number;
+  /** True when Stage 1 JSON parse failed and fields are fallbacks (F10). */
+  degraded?: boolean;
 }
 
 export interface ComposeRequest {
@@ -115,6 +124,10 @@ export interface PostedReplyDiff {
   postedText: string;
   suggestionIndex: number;
   timestamp: number;
+  /** Raw Levenshtein distance between suggestion and posted text (F4 / flywheel). */
+  editDistance?: number;
+  /** `editDistance / max(len(suggestion), len(posted), 1)`. */
+  normalizedEditDistance?: number;
 }
 
 export interface GovernorState {
@@ -148,11 +161,32 @@ export type ComposeOperation = (typeof COMPOSE_OPERATIONS)[number];
 export type HarvestOperation = (typeof HARVEST_OPERATIONS)[number];
 export type AllowedOperation = (typeof ALLOWED_OPERATIONS)[number];
 
-export interface InterceptorMessage {
+export interface InterceptorGraphQLMessage {
   type: 'graphql';
-  operation: AllowedOperation;
+  /** Operation name exactly as X sent it. Never a queryId hash (P1). */
+  operation: string;
+  /** The name was unrecognised and the request variables authorised the read (P4). */
+  structural?: boolean;
   payload: unknown;
 }
+
+/**
+ * P5: silent breakage is forbidden. Every classification the interceptor makes is
+ * reported so a disappeared operation surfaces instead of producing nothing for weeks.
+ */
+export interface GraphqlHealthEvent {
+  kind: 'hit' | 'structural' | 'drop';
+  operation: string | null;
+  route: 'compose' | 'create' | 'harvest' | 'drop';
+  reason?: string;
+}
+
+export interface InterceptorTelemetryMessage {
+  type: 'graphql_telemetry';
+  payload: GraphqlHealthEvent;
+}
+
+export type InterceptorMessage = InterceptorGraphQLMessage | InterceptorTelemetryMessage;
 
 export interface CreateTweetPayload {
   tweetId?: string;
@@ -166,12 +200,14 @@ export type ExtensionMessage =
   | { type: 'COMPOSE'; postBrief: PostBrief; refinement?: RefinementChip }
   | { type: 'GET_SUGGESTIONS'; tweetId: string }
   | { type: 'VALIDATE_API_KEY'; apiKey: string; provider?: Provider }
-  | { type: 'HARVEST_REPLY'; text: string; handle: string }
+  /** A whole intercepted batch in one message — one round trip per response, not per reply. */
+  | { type: 'HARVEST_REPLY'; replies: Array<{ text: string; handle: string }> }
   | { type: 'IMPORT_MANUAL_REPLIES'; text: string; handle: string }
   | { type: 'GET_CORPUS_COUNT' }
-  | { type: 'RECORD_POST'; diff: PostedReplyDiff }
+  | { type: 'RECORD_POST'; diff: PostedReplyDiff; targetHandle?: string }
   | { type: 'GET_STYLE_CARD' }
   | { type: 'GET_GOVERNOR_STATUS'; targetHandle: string }
+  | { type: 'GET_LAST_STYLE_REGEN' }
   | { type: 'PING' };
 
 export type ExtensionResponse =
@@ -187,8 +223,21 @@ export type ExtensionResponse =
       validationModel?: string;
       corpusCount?: number;
       added?: number;
+      /** Stage timings measured in the service worker; see lib/perf.ts. */
+      timing?: PipelineTiming;
+      /** Visible before/after when the flywheel regenerates the StyleCard (~50 posts). */
+      styleRegen?: StyleCardRegenSnapshot;
     }
   | { ok: false; error: string };
+
+/** Persisted / messaged before/after from a ~50-post StyleCard regeneration. */
+export interface StyleCardRegenSnapshot {
+  at: number;
+  previous: StyleCard;
+  current: StyleCard;
+  summary: string;
+  postedDiffCount: number;
+}
 
 export interface GovernorStatus {
   remainingBudget: number;

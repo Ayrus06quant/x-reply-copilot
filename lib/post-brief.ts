@@ -7,28 +7,41 @@ import {
   extractUserId,
   extractUserName,
   getTweetFromEntry,
+  getTweetsFromEntry,
   unwrapTweet,
 } from './graphql-parser';
 import { extractMediaFromTweet } from './media';
 import type { AllowedOperation, PostBrief, ReplySnippet } from './types';
 
-function extractRepliesFromConversation(data: unknown, limit = 10): ReplySnippet[] {
+/**
+ * Top replies for avoidance. Prefer flat `tweet-*` items and expand
+ * `conversationthread-*` modules; skip the focal tweet itself.
+ */
+function extractRepliesFromConversation(
+  data: unknown,
+  limit = 10,
+  focalTweetId?: string,
+): ReplySnippet[] {
   const entries = extractTimelineEntries(data);
   const replies: ReplySnippet[] = [];
 
   for (const entry of entries) {
     if (replies.length >= limit) break;
 
-    const tweet = getTweetFromEntry(entry);
-    if (!tweet) continue;
+    for (const tweet of getTweetsFromEntry(entry)) {
+      if (replies.length >= limit) break;
 
-    const text = extractTweetText(tweet);
-    if (!text) continue;
+      const tweetId = extractTweetId(tweet);
+      if (focalTweetId && tweetId === focalTweetId) continue;
 
-    const handle = extractUserHandle(tweet);
-    const likeCount = dig<number>(tweet, 'legacy', 'favorite_count') ?? 0;
+      const text = extractTweetText(tweet);
+      if (!text) continue;
 
-    replies.push({ handle, text, likeCount });
+      const handle = extractUserHandle(tweet);
+      const likeCount = dig<number>(tweet, 'legacy', 'favorite_count') ?? 0;
+
+      replies.push({ handle, text, likeCount });
+    }
   }
 
   return replies.sort((a, b) => (b.likeCount ?? 0) - (a.likeCount ?? 0));
@@ -41,6 +54,13 @@ function extractPrimaryTweet(data: unknown): unknown | null {
 
   if (threaded) {
     const entries = extractTimelineEntries({ data: { threaded_conversation_with_injections_v2: { instructions: threaded } } });
+    // Prefer the flat `tweet-*` focal entry over the first item inside a conversation module.
+    for (const entry of entries) {
+      const entryId = dig<string>(entry, 'entryId') ?? '';
+      if (entryId.startsWith('conversationthread-') || entryId.startsWith('cursor-')) continue;
+      const tweet = getTweetFromEntry(entry);
+      if (tweet && (extractTweetText(tweet) || extractTweetId(tweet))) return tweet;
+    }
     for (const entry of entries) {
       const tweet = getTweetFromEntry(entry);
       if (tweet && extractTweetText(tweet)) return tweet;
@@ -69,6 +89,12 @@ export function mergePostBrief(existing: PostBrief | null, incoming: PostBrief):
     authorName: incoming.authorName || existing.authorName,
     createdAt: incoming.createdAt ?? existing.createdAt,
     url: incoming.url ?? existing.url,
+    // The merged brief keeps whichever media and replies were richer, so once GraphQL has
+    // contributed, a later DOM scrape does not downgrade the recorded provenance.
+    source:
+      existing.source === 'graphql' || incoming.source === 'graphql'
+        ? 'graphql'
+        : incoming.source,
   };
 }
 
@@ -86,7 +112,11 @@ export function buildPostBrief(operation: AllowedOperation, data: unknown): Post
   switch (operation) {
     case 'TweetDetail': {
       tweet = extractPrimaryTweet(data);
-      topReplies = extractRepliesFromConversation(data, 10);
+      topReplies = extractRepliesFromConversation(
+        data,
+        10,
+        tweet ? extractTweetId(tweet) : undefined,
+      );
       break;
     }
     case 'HomeTimeline':
@@ -146,27 +176,29 @@ export function extractOwnReplies(
     /Replies|TweetsAndReplies|ProfileTweets/i.test(operation ?? '');
 
   for (const entry of entries) {
-    const tweet = unwrapTweet(getTweetFromEntry(entry));
-    if (!tweet) continue;
+    for (const rawTweet of getTweetsFromEntry(entry)) {
+      const tweet = unwrapTweet(rawTweet);
+      if (!tweet) continue;
 
-    const handle = extractUserHandle(tweet);
-    const tweetUserId = extractUserId(tweet);
-    const isOwn =
-      (options?.ownUserId && tweetUserId === options.ownUserId) ||
-      handle.toLowerCase() === ownHandle.toLowerCase();
-    if (!isOwn) continue;
+      const handle = extractUserHandle(tweet);
+      const tweetUserId = extractUserId(tweet);
+      const isOwn =
+        (options?.ownUserId && tweetUserId === options.ownUserId) ||
+        handle.toLowerCase() === ownHandle.toLowerCase();
+      if (!isOwn) continue;
 
-    const inReplyTo =
-      dig<string>(tweet, 'legacy', 'in_reply_to_status_id_str') ??
-      dig<string>(tweet, 'legacy', 'in_reply_to_status_id');
-    const inReplyToUser =
-      dig<string>(tweet, 'legacy', 'in_reply_to_user_id_str') ??
-      dig<string>(tweet, 'legacy', 'in_reply_to_user_id');
+      const inReplyTo =
+        dig<string>(tweet, 'legacy', 'in_reply_to_status_id_str') ??
+        dig<string>(tweet, 'legacy', 'in_reply_to_status_id');
+      const inReplyToUser =
+        dig<string>(tweet, 'legacy', 'in_reply_to_user_id_str') ??
+        dig<string>(tweet, 'legacy', 'in_reply_to_user_id');
 
-    if (!relaxedReplyCheck && !inReplyTo && !inReplyToUser) continue;
+      if (!relaxedReplyCheck && !inReplyTo && !inReplyToUser) continue;
 
-    const text = extractTweetText(tweet);
-    if (text) results.push({ text, handle });
+      const text = extractTweetText(tweet);
+      if (text) results.push({ text, handle });
+    }
   }
 
   return results;

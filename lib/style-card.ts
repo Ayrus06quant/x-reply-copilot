@@ -54,7 +54,6 @@ export function deriveStyleCard(replies: string[], handle?: string): StyleCard {
 
   const wordCounts = replies.map(wordCount);
   const totalWords = replies.reduce((sum, t) => sum + wordCount(t), 0);
-  const totalChars = replies.reduce((sum, t) => sum + t.length, 0);
 
   let contractionHits = 0;
   let emojiHits = 0;
@@ -82,7 +81,8 @@ export function deriveStyleCard(replies: string[], handle?: string): StyleCard {
     wordCountP75: percentile(wordCounts, 0.75),
     contractionRate: totalWords > 0 ? contractionHits / totalWords : 0.35,
     lowercaseOpenerRate: replies.length > 0 ? lowercaseOpeners / replies.length : 0.5,
-    emojiRate: totalChars > 0 ? emojiHits / replies.length : 0.05,
+    // Per-reply average emoji count (F12). Guard must match the divisor.
+    emojiRate: replies.length > 0 ? emojiHits / replies.length : 0.05,
     exclamationRate: replies.length > 0 ? exclamationHits / replies.length : 0.05,
     openers: extractOpeners(replies),
     closers: [],
@@ -98,7 +98,7 @@ export function formatStyleCardSummary(card: StyleCard): string {
   const lines = [
     `You average ${card.medianWordCount} words per reply (${card.wordCountP25}–${card.wordCountP75} range).`,
     `Lowercase openers: ${(card.lowercaseOpenerRate * 100).toFixed(0)}% of the time.`,
-    `Emoji rate: ~${(card.emojiRate * 100).toFixed(1)}% per reply.`,
+    `Emoji rate: ~${card.emojiRate.toFixed(2)} emoji per reply.`,
     card.signaturePhrases.length
       ? `Signature phrases: ${card.signaturePhrases.map((p) => `"${p}"`).join(', ')}.`
       : 'No strong signature phrases detected yet.',

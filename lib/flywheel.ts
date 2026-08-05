@@ -1,25 +1,14 @@
-import type { PostedReplyDiff, StyleCard } from './types';
-import { rebuildStyleCardFromCorpus, loadStyleCard } from './corpus';
+import type { PostedReplyDiff, StyleCard, StyleCardRegenSnapshot } from './types';
+import { openDb, rebuildStyleCardFromCorpus, loadStyleCard, harvestReply } from './corpus';
 import { formatStyleCardSummary } from './style-card';
 
-const DB_NAME = 'x_reply_copilot';
-const DB_VERSION = 1;
+// F5: this module used to declare `x_reply_copilot` at version 1 with only `posted_diffs`.
+// On a fresh profile, whichever module opened first won, and if this one did, `replies` and
+// `style_card` were never created and no later upgrade could fire. `lib/corpus.ts` now owns
+// the schema outright and this module borrows its connection.
 const STORE_DIFFS = 'posted_diffs';
 const REGEN_INTERVAL = 50;
-
-function openDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
-    request.onupgradeneeded = (event) => {
-      const db = (event.target as IDBOpenDBRequest).result;
-      if (!db.objectStoreNames.contains(STORE_DIFFS)) {
-        db.createObjectStore(STORE_DIFFS, { keyPath: 'id', autoIncrement: true });
-      }
-    };
-  });
-}
+export const LAST_STYLE_REGEN_KEY = 'xrcLastStyleRegen';
 
 export async function storePostedDiff(diff: PostedReplyDiff): Promise<void> {
   const db = await openDb();
@@ -56,6 +45,24 @@ export interface StyleCardRegenResult {
   previous?: StyleCard;
   current: StyleCard;
   summary?: string;
+  postedDiffCount?: number;
+}
+
+async function persistRegenSnapshot(snapshot: StyleCardRegenSnapshot): Promise<void> {
+  try {
+    await chrome.storage.local.set({ [LAST_STYLE_REGEN_KEY]: snapshot });
+  } catch {
+    /* storage unavailable in non-extension harnesses */
+  }
+}
+
+export async function getLastStyleRegen(): Promise<StyleCardRegenSnapshot | undefined> {
+  try {
+    const result = await chrome.storage.local.get(LAST_STYLE_REGEN_KEY);
+    return result[LAST_STYLE_REGEN_KEY] as StyleCardRegenSnapshot | undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Regenerate StyleCard every ~50 posted replies; return before/after when triggered. */
@@ -64,21 +71,34 @@ export async function maybeRegenerateStyleCard(handle?: string): Promise<StyleCa
   const previous = await loadStyleCard();
 
   if (count > 0 && count % REGEN_INTERVAL === 0) {
+    // Posted texts were inserted into `replies` by `recordCreateTweet`, so this re-derives
+    // from harvest + posted voice data rather than an unchanged harvest-only corpus (F4).
     const current = await rebuildStyleCardFromCorpus(handle);
+    const summary = formatStyleCardSummary(current);
+    if (previous) {
+      await persistRegenSnapshot({
+        at: Date.now(),
+        previous,
+        current,
+        summary,
+        postedDiffCount: count,
+      });
+    }
     return {
       regenerated: true,
       previous: previous ?? undefined,
       current,
-      summary: formatStyleCardSummary(current),
+      summary,
+      postedDiffCount: count,
     };
   }
 
   if (previous) {
-    return { regenerated: false, current: previous };
+    return { regenerated: false, current: previous, postedDiffCount: count };
   }
 
   const current = await rebuildStyleCardFromCorpus(handle);
-  return { regenerated: false, current };
+  return { regenerated: false, current, postedDiffCount: count };
 }
 
 export function computeEditDistance(a: string, b: string): number {
@@ -99,21 +119,41 @@ export function computeEditDistance(a: string, b: string): number {
   return dp[m]![n]!;
 }
 
+export function normalizedEditDistance(a: string, b: string): number {
+  const distance = computeEditDistance(a, b);
+  const denom = Math.max(a.length, b.length, 1);
+  return distance / denom;
+}
+
+/**
+ * CreateTweet ground truth → posted_diffs (+ edit distance) → replies corpus → StyleCard.
+ * Serves `[plan todo:flywheel]` / F4.
+ */
 export async function recordCreateTweet(
   postedText: string,
   inReplyToId: string | undefined,
   servedText: string | undefined,
   servedIndex: number,
+  handle?: string,
 ): Promise<StyleCardRegenResult | null> {
   if (!postedText) return null;
 
+  const suggestionText = servedText ?? '';
+  const editDistance = computeEditDistance(suggestionText, postedText);
+  const normalized = normalizedEditDistance(suggestionText, postedText);
+
   await storePostedDiff({
     tweetId: inReplyToId ?? 'unknown',
-    suggestionText: servedText ?? '',
+    suggestionText,
     postedText,
     suggestionIndex: servedIndex,
     timestamp: Date.now(),
+    editDistance,
+    normalizedEditDistance: normalized,
   });
 
-  return maybeRegenerateStyleCard();
+  // Without this, regeneration re-derives an identical card from an unchanged harvest corpus.
+  await harvestReply(postedText, handle ?? 'posted');
+
+  return maybeRegenerateStyleCard(handle);
 }

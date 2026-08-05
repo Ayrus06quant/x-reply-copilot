@@ -1,8 +1,25 @@
-import type { AllowedOperation, ComposeOperation } from './types';
+import { COMPOSE_OPERATIONS, HARVEST_OPERATIONS } from './types';
+import type { ComposeOperation, HarvestOperation } from './types';
 
-const COMPOSE_OPS = new Set<string>(['TweetDetail', 'HomeTimeline', 'CreateTweet']);
-const HARVEST_NAME_RE =
-  /UserTweets|Replies|TweetsAndReplies|ProfileTimeline|ProfileTweets|UserMedia|UserWithProfile|ProfileModules/i;
+/**
+ * P2: one allowlist, derived from the declared constants rather than restated here.
+ * The previous runtime definition was a hardcoded Set plus a broad regex, and it had
+ * already drifted from `lib/types.ts` (F20). A regex is also not "an explicit
+ * operation-name allowlist", which is the wording the privacy claim rests on (I6).
+ *
+ * P1: these are OPERATION NAMES. The rotating `<queryId>` hash never appears here and
+ * must never be matched on — X regenerates it on essentially every frontend deploy.
+ */
+const COMPOSE_OPS: ReadonlySet<string> = new Set<string>(COMPOSE_OPERATIONS);
+const HARVEST_OPS: ReadonlySet<string> = new Set<string>(HARVEST_OPERATIONS);
+
+/**
+ * P4: operations that may never be read through the structural fallback, whatever their
+ * request variables look like. The `https://x.com/*` host permission grants access to
+ * DMs and drafts; this is the veto that keeps a shape heuristic from ever reaching them.
+ */
+const DENIED_NAME_RE =
+  /\b(dm|direct_?message|conversation|draft|notification|settings|bookmark|mute|block|password|email|phone|payment|subscription|card_?private|typeahead)/i;
 
 /** True when URL targets X's GraphQL API. */
 export function isGraphQLUrl(url: string): boolean {
@@ -65,19 +82,37 @@ export function isComposeOperation(name: string | null): name is ComposeOperatio
   return !!name && COMPOSE_OPS.has(name);
 }
 
-export function isHarvestOperation(name: string | null): boolean {
+export function isHarvestOperation(name: string | null): name is HarvestOperation {
   if (!name) return false;
   if (COMPOSE_OPS.has(name)) return false;
-  if (HARVEST_NAME_RE.test(name)) return true;
-  return false;
+  return HARVEST_OPS.has(name);
 }
 
-export function isAllowedOperation(name: string | null): name is AllowedOperation {
-  if (!name) return false;
-  return isComposeOperation(name) || isHarvestOperation(name);
+/**
+ * P4: a hard veto on the structural fallback. Matches on the operation NAME only, so it
+ * costs nothing and runs before any body is touched.
+ */
+export function isDeniedOperation(name: string | null): boolean {
+  return !!name && DENIED_NAME_RE.test(name);
 }
 
-/** Profile timelines include userId in variables — used when operation hash rotates. */
+/**
+ * P4 structural fallback: recognises a tweet-detail request from its *variables*, not its
+ * name, so a renamed operation still works. Reads no response body — this decides whether
+ * the body may be read at all.
+ */
+export function isTweetDetailRequest(url: string, init?: RequestInit): boolean {
+  const variables = extractGraphQLVariables(url, init);
+  if (!variables) return false;
+  return (
+    typeof variables.focalTweetId === 'string' ||
+    typeof variables.focalTweetId === 'number' ||
+    typeof variables.tweetId === 'string' ||
+    typeof variables.tweetId === 'number'
+  );
+}
+
+/** Profile timelines include userId in variables — used when the operation name rotates. */
 export function isProfileTimelineRequest(url: string, init?: RequestInit): boolean {
   const operation = extractOperationName(url, init);
   if (operation && isHarvestOperation(operation)) return true;
@@ -85,6 +120,31 @@ export function isProfileTimelineRequest(url: string, init?: RequestInit): boole
   const variables = extractGraphQLVariables(url, init);
   if (!variables) return false;
   return typeof variables.userId === 'string' || typeof variables.userId === 'number';
+}
+
+/**
+ * P4: second gate on the structural path. Confirms a payload is actually tweet-shaped
+ * before anything is extracted from it, so a request that merely carried a `userId`
+ * variable cannot smuggle a non-timeline payload through.
+ */
+export function looksLikeTweetPayload(data: unknown): boolean {
+  if (!dig<Record<string, unknown>>(data, 'data')) return false;
+  if (
+    dig(data, 'data', 'threaded_conversation_with_injections_v2') ??
+    dig(data, 'data', 'tweetDetail') ??
+    dig(data, 'data', 'tweetResult') ??
+    dig(data, 'data', 'home', 'home_timeline_urt')
+  ) {
+    return true;
+  }
+  const userTimeline =
+    dig(data, 'data', 'user', 'result', 'timeline_v2') ??
+    dig(data, 'data', 'user', 'result', 'timeline') ??
+    dig(data, 'data', 'user', 'result', 'profile_timeline_v2') ??
+    dig(data, 'data', 'user', 'result', 'profile_timeline');
+  if (userTimeline) return true;
+
+  return extractTimelineEntries(data).length > 0;
 }
 
 /** Safely parse JSON response from fetch clone. */
@@ -173,14 +233,42 @@ export function unwrapTweet(raw: unknown): unknown | null {
   return null;
 }
 
-/** Get tweet result object from a timeline entry. */
-export function getTweetFromEntry(entry: unknown): unknown {
-  const raw =
+/**
+ * Expand one timeline entry into zero or more tweet results.
+ *
+ * TweetDetail nests replies under `TimelineTimelineModule` / `conversationthread-*`
+ * entries (`content.items[].item.itemContent`), not as flat `TimelineTimelineItem`s.
+ * Reading only `content.itemContent` yields the focal tweet (and its media) while
+ * silently dropping every reply — the live `topReplies: 0` failure mode.
+ */
+export function getTweetsFromEntry(entry: unknown): unknown[] {
+  const flatRaw =
     dig(entry, 'content', 'itemContent', 'tweet_results', 'result') ??
     dig(entry, 'content', 'itemContent', 'tweetResult', 'result') ??
     dig(entry, 'item', 'itemContent', 'tweet_results', 'result') ??
     dig(entry, 'content', 'content', 'tweetResult', 'result', 'result');
-  return unwrapTweet(raw);
+  const flat = unwrapTweet(flatRaw);
+  if (flat) return [flat];
+
+  const items = dig<unknown[]>(entry, 'content', 'items');
+  if (!items?.length) return [];
+
+  const tweets: unknown[] = [];
+  for (const item of items) {
+    const itemRaw =
+      dig(item, 'item', 'itemContent', 'tweet_results', 'result') ??
+      dig(item, 'item', 'itemContent', 'tweetResult', 'result') ??
+      dig(item, 'itemContent', 'tweet_results', 'result') ??
+      dig(item, 'itemContent', 'tweetResult', 'result');
+    const tweet = unwrapTweet(itemRaw);
+    if (tweet) tweets.push(tweet);
+  }
+  return tweets;
+}
+
+/** First tweet result from a timeline entry, or null. */
+export function getTweetFromEntry(entry: unknown): unknown {
+  return getTweetsFromEntry(entry)[0] ?? null;
 }
 
 /** Extract full text from legacy or note_tweet. */
@@ -244,7 +332,13 @@ export function extractMediaEntities(tweet: unknown): unknown[] {
 }
 
 /** Parse CreateTweet response for posted text. */
-export function parseCreateTweet(data: unknown): { fullText: string; tweetId?: string; inReplyTo?: string } | null {
+export function parseCreateTweet(data: unknown): {
+  fullText: string;
+  tweetId?: string;
+  inReplyTo?: string;
+  /** Screen name of the account being replied to — governor keys by handle (F2). */
+  inReplyToHandle?: string;
+} | null {
   const raw =
     dig(data, 'data', 'create_tweet', 'tweet_results', 'result') ??
     dig(data, 'data', 'notetweet_create', 'tweet_results', 'result');
@@ -257,9 +351,15 @@ export function parseCreateTweet(data: unknown): { fullText: string; tweetId?: s
   const inReplyTo =
     dig<string>(result, 'legacy', 'in_reply_to_status_id_str') ??
     dig<string>(result, 'legacy', 'in_reply_to_status_id');
+  const inReplyToHandle = dig<string>(result, 'legacy', 'in_reply_to_screen_name') ?? undefined;
 
   if (!text) return null;
-  return { fullText: text, tweetId, inReplyTo: inReplyTo ?? undefined };
+  return {
+    fullText: text,
+    tweetId,
+    inReplyTo: inReplyTo ?? undefined,
+    inReplyToHandle,
+  };
 }
 
 /** Try to read logged-in user's handle from Viewer / account GraphQL payloads. */

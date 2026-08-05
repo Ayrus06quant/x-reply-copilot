@@ -2,7 +2,16 @@ import { deriveStyleCard } from './style-card';
 import type { StyleCard } from './types';
 
 const DB_NAME = 'x_reply_copilot';
-const DB_VERSION = 1;
+
+/**
+ * Bumped from 1 to 2 as part of F5. `lib/flywheel.ts` used to declare this same database at
+ * version 1 with only `posted_diffs`, so whichever module opened first on a fresh profile
+ * decided the schema — and if flywheel won, `replies` and `style_card` never existed and no
+ * upgrade could ever fire, because the version already matched. The bump is what rescues a
+ * profile already stuck in that state: it forces one upgrade pass whose creates are
+ * idempotent, so any missing store is added rather than the user having to clear site data.
+ */
+const DB_VERSION = 2;
 const STORE_REPLIES = 'replies';
 const STORE_STYLE = 'style_card';
 const STORE_DIFFS = 'posted_diffs';
@@ -15,18 +24,36 @@ export interface CorpusReply {
   harvestedAt: number;
 }
 
-function openDb(): Promise<IDBDatabase> {
+/**
+ * The single owner of the `x_reply_copilot` schema. Every module that needs the database —
+ * including `lib/flywheel.ts` — opens it through here. Two independent declarations at the
+ * same version was F5.
+ */
+export function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onerror = () => reject(request.error);
     request.onsuccess = () => resolve(request.result);
     request.onupgradeneeded = (event) => {
       const db = (event.target as IDBOpenDBRequest).result;
+      const tx = (event.target as IDBOpenDBRequest).transaction;
+
       if (!db.objectStoreNames.contains(STORE_REPLIES)) {
         const store = db.createObjectStore(STORE_REPLIES, { keyPath: 'id', autoIncrement: true });
         store.createIndex('handle', 'handle', { unique: false });
         store.createIndex('wordCount', 'wordCount', { unique: false });
+      } else if (tx) {
+        // A database created by the old flywheel declaration can carry the store without
+        // its indexes. Add whatever is missing rather than assuming a clean create.
+        const store = tx.objectStore(STORE_REPLIES);
+        if (!store.indexNames.contains('handle')) {
+          store.createIndex('handle', 'handle', { unique: false });
+        }
+        if (!store.indexNames.contains('wordCount')) {
+          store.createIndex('wordCount', 'wordCount', { unique: false });
+        }
       }
+
       if (!db.objectStoreNames.contains(STORE_STYLE)) {
         db.createObjectStore(STORE_STYLE, { keyPath: 'key' });
       }

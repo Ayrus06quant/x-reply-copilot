@@ -1,3 +1,4 @@
+import type { RefinementEffect } from './prompts';
 import type { StyleCard, Suggestion, VerbalizedCandidate } from './types';
 
 const EMOJI_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu;
@@ -5,6 +6,8 @@ const URL_RE = /https?:\/\/\S+/gi;
 const HANDLE_RE = /@\w+/g;
 // `.test()` on a /g regex advances lastIndex, so consecutive calls alternate. Keep this one global-free.
 const HASHTAG_TEST_RE = /#\w+/;
+const SYCOPHANTIC_OPENER_RE =
+  /^(great point|so true|this!?|love this|exactly|couldn't agree|could not agree|well said|nailed it)\b/i;
 
 const ANTHITHESIS_PATTERNS = [
   /\bnot\s+\w+[,\s]+but\b/i,
@@ -73,6 +76,28 @@ export interface GateContext {
   styleCard: StyleCard;
   allowedHandles: string[];
   corpusTexts: string[];
+  /** When set, length bounds and soft scoring follow the chip, not the raw StyleCard. */
+  refinement?: RefinementEffect;
+}
+
+function lengthBounds(ctx: GateContext): {
+  median: number;
+  p25: number;
+  p75: number;
+} {
+  const effect = ctx.refinement;
+  if (effect?.chip) {
+    return {
+      median: effect.targetWordCount,
+      p25: effect.wordCountP25,
+      p75: effect.wordCountP75,
+    };
+  }
+  return {
+    median: ctx.styleCard.medianWordCount,
+    p25: ctx.styleCard.wordCountP25,
+    p75: ctx.styleCard.wordCountP75,
+  };
 }
 
 /** Deterministic output gate — strips/fails candidates violating style constraints. */
@@ -91,16 +116,24 @@ export function passesOutputGate(text: string, ctx: GateContext): { pass: boolea
     }
   }
 
+  const bounds = lengthBounds(ctx);
   const wc = wordCount(cleaned);
-  if (wc < Math.max(3, ctx.styleCard.wordCountP25 - 5)) {
+  // Length chips tighten the slack so the adjusted P75 is not immediately undone by +15.
+  const maxSlack = ctx.refinement?.chip === 'shorter' ? 3 : 15;
+  const minFloor =
+    ctx.refinement?.chip === 'shorter'
+      ? Math.max(3, bounds.p25 - 2)
+      : Math.max(3, bounds.p25 - 5);
+  if (wc < minFloor) {
     return { pass: false, reason: 'too_short' };
   }
-  if (wc > ctx.styleCard.wordCountP75 + 15) {
+  if (wc > bounds.p75 + maxSlack) {
     return { pass: false, reason: 'too_long' };
   }
 
-  const emojiRate = emojiCount(cleaned) / Math.max(wc, 1);
-  if (emojiRate > ctx.styleCard.emojiRate + 0.15) {
+  // F12: StyleCard.emojiRate is average emoji *per reply*, not per word.
+  const emojiInReply = emojiCount(cleaned);
+  if (emojiInReply > ctx.styleCard.emojiRate + 0.15) {
     return { pass: false, reason: 'emoji_rate' };
   }
 
@@ -108,11 +141,28 @@ export function passesOutputGate(text: string, ctx: GateContext): { pass: boolea
   for (const word of BANNED_WORDS) {
     if (lower.includes(word)) return { pass: false, reason: `banned:${word}` };
   }
+  // F13: bannedPatterns are regex sources (or prose that never matched via includes).
   for (const pattern of ctx.styleCard.bannedPatterns) {
-    if (lower.includes(pattern.toLowerCase())) return { pass: false, reason: 'antithesis' };
+    try {
+      if (new RegExp(pattern, 'i').test(cleaned)) {
+        return { pass: false, reason: 'antithesis' };
+      }
+    } catch {
+      if (lower.includes(pattern.toLowerCase())) {
+        return { pass: false, reason: 'antithesis' };
+      }
+    }
   }
   for (const pat of ANTHITHESIS_PATTERNS) {
     if (pat.test(cleaned)) return { pass: false, reason: 'antithesis_pattern' };
+  }
+
+  if (ctx.refinement?.preferQuestion && !cleaned.includes('?')) {
+    return { pass: false, reason: 'missing_question' };
+  }
+
+  if (ctx.refinement?.preferPushBack && SYCOPHANTIC_OPENER_RE.test(cleaned)) {
+    return { pass: false, reason: 'sycophantic_opener' };
   }
 
   return { pass: true, cleaned };
@@ -128,6 +178,9 @@ export function rerankCandidates(
 
   const scored: Array<{ candidate: VerbalizedCandidate; score: number; cleaned: string }> = [];
 
+  const bounds = lengthBounds(ctx);
+  const effect = ctx.refinement;
+
   for (const candidate of candidates) {
     const gate = passesOutputGate(candidate.text, ctx);
     if (!gate.pass || !gate.cleaned) continue;
@@ -135,9 +188,16 @@ export function rerankCandidates(
     const vec = trigramVector(gate.cleaned);
     const styleScore = cosineSimilarity(vec, centroid);
     const lengthPenalty =
-      1 - Math.abs(wordCount(gate.cleaned) - ctx.styleCard.medianWordCount) / (ctx.styleCard.medianWordCount + 5);
+      1 - Math.abs(wordCount(gate.cleaned) - bounds.median) / (bounds.median + 5);
     const probBonus = candidate.probability * 0.2;
-    const score = styleScore * 0.6 + lengthPenalty * 0.2 + probBonus;
+    let chipBonus = 0;
+    if (effect?.preferQuestion && gate.cleaned.includes('?')) chipBonus += 0.15;
+    if (effect?.preferPushBack && candidate.intent === 'Push back') chipBonus += 0.1;
+    if (effect?.preferDirect && candidate.intent !== 'Add') chipBonus += 0.05;
+    if (effect?.preferWit && /[—–…]|\b(though|tbf|ngl|lol)\b/i.test(gate.cleaned)) {
+      chipBonus += 0.05;
+    }
+    const score = styleScore * 0.55 + lengthPenalty * 0.2 + probBonus + chipBonus;
 
     scored.push({ candidate, score, cleaned: gate.cleaned });
   }

@@ -39,6 +39,22 @@ export function buildImageUrl(
   return `${clean}?format=webp&name=${name}`;
 }
 
+function videoVariantsFromInfo(info: RawMedia['video_info']): VideoVariant[] {
+  return (info?.variants ?? [])
+    .filter((v) => v.content_type === 'video/mp4' && v.url)
+    .map((v) => ({
+      url: v.url!,
+      contentType: v.content_type!,
+      bitrate: v.bitrate,
+    }))
+    .sort((a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0));
+}
+
+/**
+ * X serves animated GIFs as looping MP4s. They ride the video-family path: poster frame
+ * for vision (`media_url_https` sized like a photo), optional `video_info` variants when
+ * present. Never treat a GIF as a still photo URL for description.
+ */
 export function extractMediaFromEntities(entities: unknown[], postHasText = true): MediaItem[] {
   const items: MediaItem[] = [];
 
@@ -52,36 +68,85 @@ export function extractMediaFromEntities(entities: unknown[], postHasText = true
     const sizes = media.sizes;
     const large = sizes?.large;
 
-    if (type === 'photo' || type === 'animated_gif') {
+    if (type === 'photo') {
       items.push({
-        type: type === 'animated_gif' ? 'animated_gif' : 'photo',
+        type: 'photo',
         url: buildImageUrl(baseUrl, sizes, postHasText),
         altText,
         width: large?.w,
         height: large?.h,
       });
-    } else if (type === 'video') {
-      const variants: VideoVariant[] = (media.video_info?.variants ?? [])
-        .filter((v) => v.content_type === 'video/mp4' && v.url)
-        .map((v) => ({
-          url: v.url!,
-          contentType: v.content_type!,
-          bitrate: v.bitrate,
-        }))
-        .sort((a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0));
-
+    } else if (type === 'video' || type === 'animated_gif') {
       items.push({
-        type: 'video',
-        url: baseUrl,
+        type: type === 'animated_gif' ? 'animated_gif' : 'video',
+        // Poster / thumb — same pbs sizing heuristic as photos; used for vision only.
+        url: buildImageUrl(baseUrl, sizes, postHasText),
         altText,
         width: large?.w,
         height: large?.h,
-        videoVariants: variants,
+        videoVariants: videoVariantsFromInfo(media.video_info),
       });
     }
   }
 
   return items;
+}
+
+/** True when a pbs poster URL is from X's GIF pipeline (`tweet_video_thumb`). */
+export function isGifPosterUrl(url: string): boolean {
+  return /tweet_video_thumb/i.test(url);
+}
+
+/** X allows up to 4 photos; describe at most that many in one comprehend pass. */
+export const MAX_DESCRIBE_MEDIA = 4;
+
+/** Explicit unavailability — never silently omit media from the compose prompt (§7.4). */
+export const MEDIA_UNREADABLE =
+  'Media is present on this post but could not be described.';
+
+export function isVisualMedia(item: MediaItem): boolean {
+  return item.type === 'photo' || item.type === 'video' || item.type === 'animated_gif';
+}
+
+export function selectMediaForDescription(media: MediaItem[]): MediaItem[] {
+  return media.filter(isVisualMedia).slice(0, MAX_DESCRIBE_MEDIA);
+}
+
+export function visionPromptForMedia(item: MediaItem): string {
+  if (item.type === 'animated_gif') {
+    return (
+      'This is an animated GIF (looping motion). Describe the key subject and implied motion ' +
+      'in one sentence for reply context. Output plain text only.'
+    );
+  }
+  if (item.type === 'video') {
+    return 'Describe this video thumbnail in one sentence for reply context. Output plain text only.';
+  }
+  return 'Describe this image in one sentence for reply context. Output plain text only.';
+}
+
+export function fallbackDescriptionForMedia(item: MediaItem): string {
+  if (item.type === 'animated_gif') {
+    return 'Animated GIF (poster frame only; motion not extracted)';
+  }
+  if (item.type === 'video') return 'Video post (poster frame only)';
+  return MEDIA_UNREADABLE;
+}
+
+/** Join per-item descriptions; state partial view when not all media were covered. */
+export function combineMediaDescriptions(
+  descriptions: Array<{ index: number; text: string }>,
+  totalMedia: number,
+): string {
+  const usable = descriptions.filter((d) => d.text.trim());
+  if (usable.length === 0) return '';
+  if (usable.length === 1 && totalMedia <= 1) return usable[0]!.text.trim();
+
+  const lines = usable.map((d) => `Media ${d.index + 1}: ${d.text.trim()}`);
+  if (usable.length < totalMedia) {
+    lines.push(`(Partial view: described ${usable.length} of ${totalMedia} media items.)`);
+  }
+  return lines.join('\n');
 }
 
 /** Pick lowest-bitrate MP4 for poster/keyframe extraction in SW. */

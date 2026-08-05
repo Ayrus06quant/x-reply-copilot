@@ -1,6 +1,115 @@
-import type { ComposeRequest, Conditioning, PostBrief, StyleCard, VerbalizedCandidate } from './types';
+import type {
+  ComposeRequest,
+  Conditioning,
+  PostBrief,
+  RefinementChip,
+  StyleCard,
+  VerbalizedCandidate,
+} from './types';
 
 export const COMPOSE_CANDIDATE_COUNT = 5;
+
+/**
+ * Machine-readable chip effect. Length chips rewrite the numeric target that used to stay
+ * pinned at StyleCard.medianWordCount in four places (style-facts, exemplars, rerank,
+ * gate). Non-length chips keep the measured length band but carry a dominant instruction
+ * plus soft rerank biases. Prior draft is intentionally not passed back — this is a
+ * directed regeneration, not an edit of the previous suggestion.
+ */
+export interface RefinementEffect {
+  chip?: RefinementChip;
+  instruction: string;
+  targetWordCount: number;
+  wordCountP25: number;
+  wordCountP75: number;
+  preferQuestion: boolean;
+  preferPushBack: boolean;
+  preferWit: boolean;
+  preferDirect: boolean;
+}
+
+/** One adjustment, threaded through prompt / exemplars / gate / rerank. */
+export function resolveRefinementEffect(
+  styleCard: StyleCard,
+  chip?: RefinementChip,
+): RefinementEffect {
+  const base: RefinementEffect = {
+    chip,
+    instruction: '',
+    targetWordCount: styleCard.medianWordCount,
+    wordCountP25: styleCard.wordCountP25,
+    wordCountP75: styleCard.wordCountP75,
+    preferQuestion: false,
+    preferPushBack: false,
+    preferWit: false,
+    preferDirect: false,
+  };
+
+  if (!chip) return base;
+
+  switch (chip) {
+    case 'shorter': {
+      const targetWordCount = Math.max(4, Math.round(styleCard.medianWordCount * 0.55));
+      const wordCountP25 = Math.max(3, Math.round(styleCard.wordCountP25 * 0.55));
+      const wordCountP75 = Math.max(
+        targetWordCount + 2,
+        Math.round(styleCard.medianWordCount * 0.85),
+      );
+      return {
+        ...base,
+        targetWordCount,
+        wordCountP25,
+        wordCountP75,
+        instruction:
+          `REFINEMENT (overrides all length guidance): every reply must be noticeably shorter — ` +
+          `aim for ~${targetWordCount} words, hard ceiling ${wordCountP75}. Cut filler; keep one point.`,
+      };
+    }
+    case 'sharper':
+      return {
+        ...base,
+        preferDirect: true,
+        instruction:
+          'REFINEMENT (overrides hedging): every reply must be more direct and pointed. ' +
+          'Lead with the claim; no throat-clearing or soft openers.',
+      };
+    case 'funnier':
+      return {
+        ...base,
+        preferWit: true,
+        instruction:
+          'REFINEMENT (overrides earnest tone): every reply needs dry wit. ' +
+          'No forced punchlines, no emoji comedy, no "lol" padding.',
+      };
+    case 'less_agreeable':
+      return {
+        ...base,
+        preferPushBack: true,
+        instruction:
+          'REFINEMENT (overrides agreeableness): push back or complicate. ' +
+          'Ban sycophantic openers ("great point", "this!", "love this", "so true").',
+      };
+    case 'add_question':
+      return {
+        ...base,
+        preferQuestion: true,
+        instruction:
+          'REFINEMENT (overrides closing style): every candidate must end with a genuine question ' +
+          'that invites a real answer (must include "?").',
+      };
+  }
+}
+
+/** StyleCard length fields rewritten for the active chip (or unchanged). */
+export function styleCardForRefinement(styleCard: StyleCard, effect: RefinementEffect): StyleCard {
+  if (!effect.chip) return styleCard;
+  return {
+    ...styleCard,
+    medianWordCount: effect.targetWordCount,
+    wordCountP25: effect.wordCountP25,
+    wordCountP75: effect.wordCountP75,
+  };
+}
 
 const BANNED_WORDS = [
   'delve',
@@ -12,7 +121,17 @@ const BANNED_WORDS = [
 ];
 
 export function fenceUntrusted(label: string, content: string): string {
-  return `<untrusted_${label}>\n${content}\n</untrusted_${label}>`;
+  // A fence the content can close is not a fence. Observed 2026-08-06: a reply containing
+  // the literal closing tag ended the block and its remaining text landed in the
+  // instruction channel, which is exactly what I7 forbids. Applies to every fenced field,
+  // not just the one that surfaced it.
+  const neutralized = content.replace(/<\/?untrusted_[a-z_]*>/gi, '[fence]');
+  return `<untrusted_${label}>\n${neutralized}\n</untrusted_${label}>`;
+}
+
+/** X handles are 1–15 chars of letters, digits, underscore (F9). */
+export function sanitizeAuthorHandle(handle: string): string {
+  return /^[A-Za-z0-9_]{1,15}$/.test(handle) ? handle : 'unknown';
 }
 
 export function buildComprehendPrompt(postBrief: PostBrief, imageDescription?: string): string {
@@ -20,6 +139,7 @@ export function buildComprehendPrompt(postBrief: PostBrief, imageDescription?: s
     postBrief.topReplies.length > 0
       ? postBrief.topReplies.map((r) => `@${r.handle}: ${r.text}`).join('\n')
       : '(none captured)';
+  const authorHandle = sanitizeAuthorHandle(postBrief.authorHandle);
 
   return `You are a structured analysis module. Output ONLY valid JSON with no markdown fences.
 
@@ -34,7 +154,7 @@ Analyze the post below and return:
 }
 
 ${fenceUntrusted('post', postBrief.text)}
-Author: @${postBrief.authorHandle}
+Author: @${authorHandle}
 ${imageDescription ? fenceUntrusted('image', imageDescription) : ''}
 ${fenceUntrusted('top_replies', repliesBlock)}`;
 }
@@ -59,23 +179,49 @@ Rules for the JSON:
 - "probability" is a number between 0 and 1; the five should sum to about 1.0.
 - Each reply must be distinct in angle.`;
 
+function composeMediaBlock(req: ComposeRequest): string {
+  const desc = req.comprehend.imageDescription.trim();
+  if (desc) return fenceUntrusted('post_image', desc);
+  // Silence is not acceptable when the post clearly has media (§7.4).
+  const hasMedia = req.postBrief.media.some(
+    (m) => m.type === 'photo' || m.type === 'animated_gif' || m.type === 'video',
+  );
+  if (hasMedia) {
+    return fenceUntrusted(
+      'post_image',
+      'Media is present on this post but could not be described.',
+    );
+  }
+  return '';
+}
+
 export function buildComposePrompt(req: ComposeRequest): string {
   const { comprehend, styleCard, exemplars, conditioning, refinement, username } = req;
-  const targetWords = styleCard.medianWordCount;
+  const effect = resolveRefinementEffect(styleCard, refinement);
+  const lengthCard = styleCardForRefinement(styleCard, effect);
 
   const sections: string[] = [
     `Complete what @${username} would post as a reply. Write in third person about @${username}'s voice — do NOT address the reader as "you".`,
+    // Chip direction first so it outvotes the measured length band that used to win.
+    effect.instruction,
     `Style facts (measured, not aspirational):
-- Target ~${targetWords} words (${styleCard.wordCountP25}-${styleCard.wordCountP75} range)
+- Target ~${lengthCard.medianWordCount} words (${lengthCard.wordCountP25}-${lengthCard.wordCountP75} range)
 - Contraction rate: ${(styleCard.contractionRate * 100).toFixed(0)}%
-- Emoji rate: max ${(styleCard.emojiRate * 100).toFixed(1)}% of replies
+- Emoji rate: max ~${styleCard.emojiRate.toFixed(2)} emoji per reply
 - Lowercase openers: ${(styleCard.lowercaseOpenerRate * 100).toFixed(0)}% of the time
 - Signature phrases (use sparingly): ${styleCard.signaturePhrases.slice(0, 5).join(', ') || 'none'}
-- NEVER use: ${[...styleCard.bannedPatterns, ...BANNED_WORDS].join(', ')}
+- NEVER use antithesis constructions (not X, but Y; not just…; it's not about…)
+- NEVER use: ${BANNED_WORDS.join(', ')}
 - No URLs, no hashtags, no @handles not in the thread`,
     conditioningBlock(conditioning),
+    // This list is derived from other users' reply text, so it is untrusted input and is
+    // fenced like every other outside-origin field (I7 / F9). It used to be interpolated
+    // straight into the instruction channel.
     `Avoid repeating what top replies already said:
-${comprehend.repliesAlreadySaid.map((r) => `- ${r}`).join('\n') || '- (none listed)'}`,
+${fenceUntrusted(
+  'replies_already_said',
+  comprehend.repliesAlreadySaid.map((r) => `- ${r}`).join('\n') || '- (none listed)',
+)}`,
     // Corpus is empty by default — omit the section entirely rather than emit an empty list.
     exemplars.length > 0
       ? `Exemplars of @${username}'s reply style (match length and register, NOT topic):\n${exemplars
@@ -85,10 +231,7 @@ ${comprehend.repliesAlreadySaid.map((r) => `- ${r}`).join('\n') || '- (none list
     fenceUntrusted('post_claim', comprehend.claim),
     fenceUntrusted('post_tone', comprehend.tone),
     fenceUntrusted('post_text', req.postBrief.text),
-    comprehend.imageDescription.trim()
-      ? fenceUntrusted('post_image', comprehend.imageDescription.trim())
-      : '',
-    refinement ? refinementInstruction(refinement) : '',
+    composeMediaBlock(req),
     COMPOSE_OUTPUT_CONTRACT,
   ];
 
@@ -101,17 +244,6 @@ function conditioningBlock(c: Conditioning): string {
   if (c.neverMention) parts.push(`Never mention: ${c.neverMention}`);
   if (c.defaultIntent) parts.push(`Default intent bias: ${c.defaultIntent}`);
   return parts.length ? `Conditioning:\n${parts.join('\n')}` : '';
-}
-
-function refinementInstruction(chip: string): string {
-  const map: Record<string, string> = {
-    shorter: 'Make replies noticeably shorter.',
-    sharper: 'Make replies more direct and pointed.',
-    funnier: 'Add dry wit without forced jokes.',
-    less_agreeable: 'Push back more; avoid sycophantic openers.',
-    add_question: 'End at least one candidate with a genuine question.',
-  };
-  return `Refinement: ${map[chip] ?? chip}`;
 }
 
 const COMPOSE_INTENTS = ['Add', 'Ask', 'Push back'] as const;
@@ -472,7 +604,12 @@ export const DEFAULT_STYLE_CARD: StyleCard = {
   openers: [],
   closers: [],
   signaturePhrases: [],
-  bannedPatterns: ['not X, but Y', 'not just X', "it's not about"],
+  // F13: regex sources tested with RegExp; prompt describes the patterns in words.
+  bannedPatterns: [
+    String.raw`\bnot\s+\w+[,\s]+but\b`,
+    String.raw`\bnot just\b`,
+    String.raw`\bit'?s not about\b`,
+  ],
   corpusSize: 0,
   updatedAt: Date.now(),
 };

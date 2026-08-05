@@ -4,7 +4,9 @@ import type { ExtensionMessage, ExtensionResponse } from './types';
 
 const RETRY_DELAYS_MS = [0, 500, 1000, 2000];
 
+/** Options/admin calls can wait; compose/comprehend stay near the §5.4 wall clock. */
 const MESSAGE_TIMEOUT_MS = 90_000;
+const COMPOSE_MESSAGE_TIMEOUT_MS = 12_000;
 
 
 
@@ -120,13 +122,18 @@ export async function sendExtensionMessage(msg: ExtensionMessage): Promise<Exten
 
     try {
 
+      const timeoutMs =
+        msg.type === 'COMPOSE' || msg.type === 'COMPREHEND'
+          ? COMPOSE_MESSAGE_TIMEOUT_MS
+          : MESSAGE_TIMEOUT_MS;
+
       const response = await Promise.race([
 
         chrome.runtime.sendMessage(msg) as Promise<ExtensionResponse | undefined>,
 
         new Promise<never>((_, reject) => {
 
-          setTimeout(() => reject(new Error('Message timed out')), MESSAGE_TIMEOUT_MS);
+          setTimeout(() => reject(new Error('Message timed out')), timeoutMs);
 
         }),
 
@@ -148,7 +155,10 @@ export async function sendExtensionMessage(msg: ExtensionMessage): Promise<Exten
 
       lastError = error;
 
-      if (!isTransientMessagingError(error) && attempt === RETRY_DELAYS_MS.length - 1) {
+      // Non-transient errors (timeouts, invalid message, SW bugs) must not fan out
+      // across all four attempts × MESSAGE_TIMEOUT_MS — that multiplied an 8s compose
+      // into minutes. Only wake/connection races are retryable.
+      if (!isTransientMessagingError(error)) {
 
         break;
 

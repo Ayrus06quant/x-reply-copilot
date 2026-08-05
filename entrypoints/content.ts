@@ -1,5 +1,5 @@
 import './card.css';
-import type { PostBrief, RefinementChip, Suggestion } from '../lib/types';
+import type { GraphqlHealthEvent, PostBrief, RefinementChip, Suggestion } from '../lib/types';
 import {
   copyToClipboard,
   findComposer,
@@ -10,10 +10,23 @@ import {
 import { extractPostBriefFromTweetElement, findReplyTargetFromDom } from '../lib/dom-post-brief';
 import { mergePostBrief, postBriefHasVisualMedia } from '../lib/post-brief';
 import { sendExtensionMessage } from '../lib/messaging';
-import { setLastServedSuggestion } from '../lib/storage';
+import { clearCachedSuggestions, setLastServedSuggestion } from '../lib/storage';
 import { harvestDebug, mediaDebug } from '../lib/debug';
+import { logEntry, logTiming, now, since } from '../lib/perf';
 
 const CHANNEL = 'x-reply-copilot';
+/** F8: required on every postMessage crossing the MAIN ↔ ISOLATED boundary. */
+const CHANNEL_NONCE =
+  typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `xrc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+/** How long after a /status/ page opens before a missing TweetDetail is treated as breakage. */
+const TWEET_DETAIL_WATCHDOG_MS = 8000;
+/** Scanning every <script> tag is expensive; give up rather than repeat it forever (F6). */
+const OWN_USER_ID_MAX_SCANS = 5;
+const IDENTITY_DEBOUNCE_MS = 250;
+export const GRAPHQL_HEALTH_KEY = 'xrcGraphqlHealth';
 
 let currentPost: PostBrief | null = null;
 let suggestions: Suggestion[] = [];
@@ -26,9 +39,35 @@ let shadowRoot: ShadowRoot | null = null;
 let toastHost: HTMLElement | null = null;
 let toastTimeout: ReturnType<typeof setTimeout> | null = null;
 let detectedOwnHandle: string | null = null;
+let detectedOwnUserId: string | null = null;
+let ownUserIdScans = 0;
 let lastRefinement: RefinementChip | undefined;
 let feedbackTimeout: ReturnType<typeof setTimeout> | null = null;
 let isInserting = false;
+
+let identityObserver: MutationObserver | null = null;
+let identityInterval: ReturnType<typeof setInterval> | null = null;
+let identityDebounce: ReturnType<typeof setTimeout> | null = null;
+let positionFrame = 0;
+let tweetDetailWatchdog: ReturnType<typeof setTimeout> | null = null;
+
+/** Timing marks. Item 1: nothing in this project had ever been measured. */
+let replyClickAt: number | null = null;
+/** Stamped at Reply click so SPA navigation can clear `currentPost` without losing the clock. */
+let replyClickTweetId: string | null = null;
+let postOpenAt: number | null = null;
+/**
+ * In-flight post-open compose prefetch. Reply click awaits this instead of starting a
+ * second Stage 2 — `[user]` "by the time i clicked on reply the comments will already be generated".
+ */
+let composePrefetch: { tweetId: string; promise: Promise<boolean> } | null = null;
+
+const graphqlHealth = {
+  interceptorAlive: false,
+  seen: [] as string[],
+  structural: 0,
+  drops: [] as string[],
+};
 
 function isMacPlatform(): boolean {
   return /Mac|iPhone|iPad|iPod/.test(navigator.platform) ||
@@ -48,18 +87,71 @@ function isShortcutModifier(e: KeyboardEvent): boolean {
 }
 
 function relayToBackground(type: string, payload: unknown): void {
-  void chrome.runtime.sendMessage({ type, payload });
+  chrome.runtime
+    .sendMessage({ type, payload })
+    .catch((e: unknown) => console.warn(`[XRC] relay ${type} failed`, e));
+}
+
+function postToMain(msg: Record<string, unknown>): void {
+  window.postMessage({ source: CHANNEL, nonce: CHANNEL_NONCE, ...msg }, '*');
+}
+
+function isTrustedChannelEvent(event: MessageEvent): boolean {
+  if (event.source !== window) return false;
+  const data = event.data as { source?: unknown; nonce?: unknown } | null;
+  return data?.source === CHANNEL && data?.nonce === CHANNEL_NONCE;
+}
+
+function isCreateTweetPayload(
+  payload: unknown,
+): payload is { fullText: string; tweetId?: string; inReplyTo?: string; inReplyToHandle?: string } {
+  if (!payload || typeof payload !== 'object') return false;
+  const p = payload as Record<string, unknown>;
+  return typeof p.fullText === 'string' && p.fullText.length > 0;
+}
+
+function isHarvestBatch(
+  payload: unknown,
+): payload is { harvest: Array<{ text: string; handle: string }> } {
+  if (!payload || typeof payload !== 'object') return false;
+  const harvest = (payload as { harvest?: unknown }).harvest;
+  if (!Array.isArray(harvest) || harvest.length === 0) return false;
+  return harvest.every(
+    (r) =>
+      r &&
+      typeof r === 'object' &&
+      typeof (r as { text?: unknown }).text === 'string' &&
+      typeof (r as { handle?: unknown }).handle === 'string',
+  );
+}
+
+/** Never `void` a storage promise — that is exactly how F3 stayed invisible for months. */
+function persistGraphqlHealth(reason: string, tweetId?: string): void {
+  chrome.storage.local
+    .set({
+      [GRAPHQL_HEALTH_KEY]: {
+        at: new Date().toISOString(),
+        reason,
+        tweetId,
+        path: window.location.pathname,
+        interceptorAlive: graphqlHealth.interceptorAlive,
+        seen: graphqlHealth.seen,
+        structuralFallbacks: graphqlHealth.structural,
+        drops: graphqlHealth.drops.slice(0, 20),
+      },
+    })
+    .catch((e: unknown) => console.warn('[XRC GraphQL] could not persist health record', e));
 }
 
 function publishOwnHandle(handle: string): void {
   if (!handle || handle === detectedOwnHandle) return;
   detectedOwnHandle = handle;
-  window.postMessage({ source: CHANNEL, type: 'set_own_handle', handle }, '*');
+  postToMain({ type: 'set_own_handle', handle });
   harvestDebug('content published own handle', handle);
 }
 
 function publishOwnUserId(userId: string): void {
-  window.postMessage({ source: CHANNEL, type: 'set_own_user_id', userId }, '*');
+  postToMain({ type: 'set_own_user_id', userId });
   harvestDebug('content published own user id', userId);
 }
 
@@ -115,11 +207,62 @@ function detectOwnUserIdFromDom(): string | null {
   return null;
 }
 
+/**
+ * Both identifiers are one-shot facts about the logged-in session. Once they are known — or
+ * once the script sweep has failed enough times to be worth abandoning — there is nothing
+ * left to watch, so the observer and the interval both stop. Previously this ran on every
+ * DOM mutation of a virtualised timeline *and* every 5 seconds, regexing the full text of
+ * every <script> tag each time (F6).
+ */
+function identityResolved(): boolean {
+  if (!detectedOwnHandle) return false;
+  return detectedOwnUserId !== null || ownUserIdScans >= OWN_USER_ID_MAX_SCANS;
+}
+
+function stopIdentityWatchers(): void {
+  if (identityObserver) {
+    identityObserver.disconnect();
+    identityObserver = null;
+  }
+  if (identityInterval !== null) {
+    clearInterval(identityInterval);
+    identityInterval = null;
+  }
+  if (identityDebounce !== null) {
+    clearTimeout(identityDebounce);
+    identityDebounce = null;
+  }
+}
+
 function syncOwnHandle(): void {
-  const handle = detectOwnHandleFromDom();
-  if (handle) publishOwnHandle(handle);
-  const userId = detectOwnUserIdFromDom();
-  if (userId) publishOwnUserId(userId);
+  if (identityResolved()) {
+    stopIdentityWatchers();
+    return;
+  }
+
+  if (!detectedOwnHandle) {
+    const handle = detectOwnHandleFromDom();
+    if (handle) publishOwnHandle(handle);
+  }
+
+  if (detectedOwnHandle && !detectedOwnUserId && ownUserIdScans < OWN_USER_ID_MAX_SCANS) {
+    ownUserIdScans++;
+    const userId = detectOwnUserIdFromDom();
+    if (userId) {
+      detectedOwnUserId = userId;
+      publishOwnUserId(userId);
+    }
+  }
+
+  if (identityResolved()) stopIdentityWatchers();
+}
+
+function scheduleIdentitySync(): void {
+  if (identityDebounce !== null) return;
+  identityDebounce = setTimeout(() => {
+    identityDebounce = null;
+    syncOwnHandle();
+  }, IDENTITY_DEBOUNCE_MS);
 }
 
 function showActionToast(message: string): void {
@@ -170,10 +313,14 @@ function setCurrentPost(brief: PostBrief): void {
   const mediaUpgraded =
     postBriefHasVisualMedia(merged) &&
     (!prev || prev.tweetId !== merged.tweetId || prev.media.length < merged.media.length);
+  const repliesUpgraded =
+    merged.topReplies.length > 0 && (prev?.topReplies.length ?? 0) === 0;
 
   currentPost = merged;
   isReading = true;
   updateReadingIndicator();
+
+  if (!prev || prev.tweetId !== merged.tweetId) postOpenAt = now();
 
   mediaDebug('post captured', {
     tweetId: merged.tweetId,
@@ -182,7 +329,13 @@ function setCurrentPost(brief: PostBrief): void {
     mediaUpgraded,
   });
 
-  if (!prev || prev.tweetId !== merged.tweetId || mediaUpgraded) {
+  if (!prev || prev.tweetId !== merged.tweetId || mediaUpgraded || repliesUpgraded) {
+    // Richer brief invalidates drafts built from thinner Stage 1 context.
+    if (prev?.tweetId === merged.tweetId && (mediaUpgraded || repliesUpgraded)) {
+      suggestions = [];
+      composeReady = false;
+      void clearCachedSuggestions(merged.tweetId);
+    }
     void prefetchComprehend(merged);
   }
 }
@@ -204,56 +357,218 @@ function ensureCurrentPost(): boolean {
   return false;
 }
 
-function handleInterceptorMessage(event: MessageEvent): void {
-  if (event.source !== window || !event.data?.source?.startsWith?.(CHANNEL)) return;
-
-  const { operation, payload } = event.data as {
-    operation: string;
-    payload: unknown;
-  };
-
-  if (operation === 'CreateTweet') {
-    const created = payload as { fullText: string; tweetId?: string; inReplyTo?: string };
-    relayToBackground('CREATE_TWEET', created);
+/** P5: makes a disappeared operation visible instead of letting it produce nothing quietly. */
+function recordGraphqlHealth(event: GraphqlHealthEvent): void {
+  if (event.operation === 'interceptor_alive') {
+    graphqlHealth.interceptorAlive = true;
+    logEntry('interceptor replied to the replay handshake', event.reason);
     return;
   }
 
-  const harvestPayload = payload as { harvest?: Array<{ text: string; handle: string }> };
-  if (harvestPayload?.harvest?.length) {
-    const batch = harvestPayload.harvest;
+  graphqlHealth.interceptorAlive = true;
+
+  if (event.kind === 'drop') {
+    const label = `${event.operation ?? 'unnamed'} (${event.reason ?? 'no reason'})`;
+    if (!graphqlHealth.drops.includes(label)) graphqlHealth.drops.push(label);
+    return;
+  }
+
+  if (event.kind === 'structural') {
+    graphqlHealth.structural++;
+    console.warn('[XRC GraphQL] operation name unrecognised — read via the structural fallback', event);
+    persistGraphqlHealth('structural-fallback');
+  }
+
+  if (event.operation && !graphqlHealth.seen.includes(event.operation)) {
+    graphqlHealth.seen.push(event.operation);
+  }
+}
+
+function handleInterceptorMessage(event: MessageEvent): void {
+  // F8: exact channel equality + shared nonce. Forged page-console messages are dropped.
+  if (!isTrustedChannelEvent(event)) return;
+
+  const data = event.data as {
+    type?: string;
+    operation?: string;
+    payload?: unknown;
+  };
+
+  if (data.type === 'graphql_telemetry') {
+    recordGraphqlHealth(data.payload as GraphqlHealthEvent);
+    return;
+  }
+
+  // Ignore the content script's own set_own_handle / request_replay posts, which share
+  // the channel.
+  if (data.type !== 'graphql') return;
+
+  const { operation, payload } = data;
+
+  if (operation === 'CreateTweet') {
+    if (!isCreateTweetPayload(payload)) return;
+    const targetHandle =
+      (payload.inReplyTo && currentPost?.tweetId === payload.inReplyTo
+        ? currentPost.authorHandle
+        : undefined) ||
+      payload.inReplyToHandle ||
+      currentPost?.authorHandle;
+    relayToBackground('CREATE_TWEET', {
+      ...payload,
+      targetHandle,
+      ownHandle: detectedOwnHandle ?? undefined,
+    });
+    return;
+  }
+
+  if (isHarvestBatch(payload)) {
+    const batch = payload.harvest;
     if (batch[0]?.handle) publishOwnHandle(batch[0].handle);
     harvestDebug('content received harvest batch', batch.length);
-    void (async () => {
-      let stored = 0;
-      for (const r of batch) {
-        try {
-          const res = await sendExtensionMessage({
-            type: 'HARVEST_REPLY',
-            text: r.text,
-            handle: r.handle,
-          });
-          if (res.ok && res.added) stored++;
-        } catch (e) {
-          harvestDebug('HARVEST_REPLY failed', e);
-        }
-      }
-      if (stored > 0) showHarvestToast(stored);
-    })();
+    // One message for the whole batch. This used to await one round trip per reply,
+    // serially, inside the interception hot path.
+    sendExtensionMessage({ type: 'HARVEST_REPLY', replies: batch })
+      .then((res) => {
+        if (res.ok && res.added) showHarvestToast(res.added);
+      })
+      .catch((e: unknown) => harvestDebug('HARVEST_REPLY failed', e));
     return;
   }
 
   const brief = payload as PostBrief;
-  if (brief?.tweetId && (brief?.text || brief?.media?.length)) {
-    setCurrentPost(brief);
+  if (!brief?.tweetId || typeof brief.tweetId !== 'string') return;
+  if (!(typeof brief.text === 'string' || Array.isArray(brief.media))) return;
+  if (!brief.text && !(brief.media?.length)) return;
+
+  // A replayed brief is by definition older than the current page. If the URL already names
+  // a specific post, anything else is stale and must not become `currentPost`.
+  const openTweetId = window.location.pathname.match(/\/status\/(\d+)/)?.[1];
+  if (openTweetId && openTweetId !== brief.tweetId) return;
+
+  logTiming('post open — GraphQL brief received', {
+    tweetId: brief.tweetId,
+    operation,
+    topReplies: brief.topReplies?.length ?? 0,
+    media: brief.media?.length ?? 0,
+  });
+  setCurrentPost(brief);
+}
+
+/**
+ * Post-open prefetch — `[plan todo:prefetch]` + `[user]` drafts-ready-at-Reply.
+ * Q1 default: TweetDetail / status focus only (interceptor never fans out HomeTimeline).
+ * Stage 1 then Stage 2 for the same tweet; Reply click serves `suggestions:<tweetId>`.
+ */
+async function prefetchComprehend(brief: PostBrief): Promise<void> {
+  const startedAt = now();
+  try {
+    const res = await sendExtensionMessage({ type: 'COMPREHEND', postBrief: brief });
+    logTiming('comprehend resolved', {
+      tweetId: brief.tweetId,
+      source: brief.source ?? 'dom',
+      ok: res.ok,
+      topReplies: brief.topReplies?.length ?? 0,
+      roundTripMs: since(startedAt),
+      postOpenToComprehendMs: postOpenAt != null ? since(postOpenAt) : undefined,
+      worker: res.ok ? res.timing : undefined,
+    });
+    // Compose only after a usable Stage 1 — do not burn a Stage 2 on a failed comprehend.
+    if (res.ok && currentPost?.tweetId === brief.tweetId) {
+      void prefetchCompose(brief);
+    }
+  } catch (e) {
+    logTiming('comprehend prefetch failed', {
+      tweetId: brief.tweetId,
+      roundTripMs: since(startedAt),
+      error: e instanceof Error ? e.message : String(e),
+    });
   }
 }
 
-async function prefetchComprehend(brief: PostBrief): Promise<void> {
+/**
+ * Stage 2 on post-open (same tweet). Silent — no card "generating" until Reply.
+ * Caches via `handleCompose` → `suggestions:<tweetId>`.
+ */
+async function prefetchCompose(brief: PostBrief): Promise<void> {
+  if (composePrefetch?.tweetId === brief.tweetId) return;
+
+  const promise = (async (): Promise<boolean> => {
+    const startedAt = now();
+    try {
+      const existing = await sendExtensionMessage({
+        type: 'GET_SUGGESTIONS',
+        tweetId: brief.tweetId,
+      });
+      if (existing.ok && existing.suggestions?.length) {
+        if (currentPost?.tweetId === brief.tweetId) {
+          suggestions = existing.suggestions;
+          composeReady = true;
+        }
+        logTiming('compose prefetch cache hit', {
+          tweetId: brief.tweetId,
+          postOpenToComposeMs: postOpenAt != null ? since(postOpenAt) : undefined,
+        });
+        return true;
+      }
+
+      const res = await sendExtensionMessage({ type: 'COMPOSE', postBrief: brief });
+      logTiming('compose prefetch resolved', {
+        tweetId: brief.tweetId,
+        source: brief.source ?? 'dom',
+        ok: res.ok,
+        suggestionCount: res.ok ? res.suggestions?.length ?? 0 : 0,
+        roundTripMs: since(startedAt),
+        postOpenToComposeMs: postOpenAt != null ? since(postOpenAt) : undefined,
+        worker: res.ok ? res.timing : undefined,
+      });
+
+      if (res.ok && res.suggestions?.length && currentPost?.tweetId === brief.tweetId) {
+        suggestions = res.suggestions;
+        composeReady = true;
+        if (cardVisible) {
+          renderSuggestions();
+          setRefinementsEnabled(true);
+          setLoading(false);
+          if (res.governor) updateBudgetDisplay(res.governor.remainingBudget);
+          logTiming('card rendered', {
+            tweetId: brief.tweetId,
+            source: brief.source ?? 'dom',
+            refinement: 'none',
+            cache: 'prefetch',
+            clickToCardMs: replyClickAt != null ? since(replyClickAt) : undefined,
+            worker: res.timing,
+          });
+        }
+        return true;
+      }
+      return false;
+    } catch (e) {
+      logTiming('compose prefetch failed', {
+        tweetId: brief.tweetId,
+        roundTripMs: since(startedAt),
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return false;
+    }
+  })();
+
+  composePrefetch = { tweetId: brief.tweetId, promise };
   try {
-    await sendExtensionMessage({ type: 'COMPREHEND', postBrief: brief });
-  } catch {
-    /* prefetch is best-effort */
+    await promise;
+  } finally {
+    if (composePrefetch?.promise === promise) composePrefetch = null;
   }
+}
+
+function logCardRendered(cache: 'memory' | 'session' | 'prefetch' | 'compose'): void {
+  if (!currentPost) return;
+  logTiming('card rendered', {
+    tweetId: currentPost.tweetId,
+    source: currentPost.source ?? 'dom',
+    refinement: lastRefinement ?? 'none',
+    cache,
+    clickToCardMs: replyClickAt != null ? since(replyClickAt) : undefined,
+  });
 }
 
 async function loadCachedSuggestions(): Promise<boolean> {
@@ -295,6 +610,7 @@ async function composeSuggestions(refinement?: RefinementChip): Promise<void> {
   setLoading(true);
   isGenerating = true;
   lastRefinement = refinement;
+  const composeStartedAt = now();
 
   try {
     const res = await sendExtensionMessage({
@@ -308,7 +624,23 @@ async function composeSuggestions(refinement?: RefinementChip): Promise<void> {
       composeReady = true;
       renderSuggestions();
       setRefinementsEnabled(true);
-      if (res.governor?.nudge) showNudge(res.governor.nudge);
+      logTiming('card rendered', {
+        tweetId: currentPost!.tweetId,
+        source: currentPost!.source ?? 'dom',
+        refinement: refinement ?? 'none',
+        cache: res.timing?.composeCached ? 'session' : 'compose',
+        composeRoundTripMs: since(composeStartedAt),
+        clickToCardMs: replyClickAt != null ? since(replyClickAt) : undefined,
+        worker: res.timing,
+      });
+      if (res.governor) updateBudgetDisplay(res.governor.remainingBudget);
+      const nudges: string[] = [];
+      if (res.governor?.nudge) nudges.push(res.governor.nudge);
+      // F10: degraded Stage 1 must be visible, not silently reused.
+      if (res.comprehend?.degraded) {
+        nudges.push('Post analysis was thin — drafting from limited context.');
+      }
+      if (nudges.length) showNudge(nudges.join(' '));
     } else {
       composeReady = false;
       suggestions = [];
@@ -318,6 +650,7 @@ async function composeSuggestions(refinement?: RefinementChip): Promise<void> {
         ? 'The model returned no usable replies. Open the service worker console on chrome://extensions for details.'
         : res.error;
       showError(reason || 'Failed to generate suggestions', true);
+      void refreshGovernorStatus();
     }
   } catch (e) {
     composeReady = false;
@@ -347,6 +680,7 @@ function createCard(): void {
   wrapper.innerHTML = `
     <div class="xrc-header">
       <span class="xrc-reading" aria-live="polite">Reading this post</span>
+      <span class="xrc-budget" aria-live="polite" title="Daily reply budget remaining"></span>
       <button class="xrc-close" aria-label="Dismiss">×</button>
     </div>
     <div class="xrc-disclosure">This extension reads posts you view on X to suggest replies. Data goes directly to Gemini with your API key.</div>
@@ -395,9 +729,12 @@ function getInlineStyles(): string {
       background: #15202b; color: #e7e9ea; border: 1px solid #38444d; border-radius: 16px;
       padding: 12px 14px; width: 360px; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
     .xrc-hidden { display: none !important; }
-    .xrc-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .xrc-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
     .xrc-reading { font-size: 12px; color: #1d9bf0; font-weight: 600; }
     .xrc-reading.xrc-idle { color: #71767b; }
+    .xrc-budget { font-size: 11px; color: #71767b; margin-left: auto; white-space: nowrap; }
+    .xrc-budget.xrc-budget-low { color: #ffad1f; }
+    .xrc-budget.xrc-budget-blocked { color: #f4212e; }
     .xrc-close { background: none; border: none; color: #71767b; font-size: 20px; cursor: pointer; }
     .xrc-disclosure { font-size: 11px; color: #71767b; margin-bottom: 10px; line-height: 1.4; }
     .xrc-suggestion { padding: 10px 12px; margin-bottom: 8px; background: #192734; border-radius: 12px;
@@ -422,6 +759,15 @@ function getInlineStyles(): string {
   `;
 }
 
+/** Scroll fires far faster than the screen repaints; one reposition per frame is enough. */
+function schedulePositionCard(): void {
+  if (positionFrame) return;
+  positionFrame = requestAnimationFrame(() => {
+    positionFrame = 0;
+    positionCard();
+  });
+}
+
 function positionCard(): void {
   if (!cardHost || !shadowRoot) return;
   const composer = findComposer();
@@ -441,11 +787,41 @@ async function showCard(): Promise<void> {
   positionCard();
 
   ensureCurrentPost();
+  void refreshGovernorStatus();
 
-  if (composeReady && suggestions.length > 0) return;
+  if (composeReady && suggestions.length > 0) {
+    renderSuggestions();
+    setRefinementsEnabled(true);
+    setLoading(false);
+    logCardRendered('memory');
+    return;
+  }
+
+  // Prefetch still running for this tweet — show generating and await; do not double-compose.
+  const inflightPrefetch = composePrefetch;
+  if (
+    currentPost &&
+    inflightPrefetch?.tweetId === currentPost.tweetId &&
+    !isGenerating
+  ) {
+    setLoading(true);
+    const ok = await inflightPrefetch.promise;
+    if (ok && composeReady && suggestions.length > 0) {
+      renderSuggestions();
+      setRefinementsEnabled(true);
+      setLoading(false);
+      logCardRendered('prefetch');
+      return;
+    }
+  }
 
   const cached = await loadCachedSuggestions();
-  if (!cached && !isGenerating) {
+  if (cached) {
+    setLoading(false);
+    logCardRendered('session');
+    return;
+  }
+  if (!isGenerating) {
     void composeSuggestions();
   }
 }
@@ -491,6 +867,29 @@ function showNudge(msg: string): void {
   if (el) {
     el.textContent = msg;
     el.classList.remove('xrc-hidden');
+  }
+}
+
+/** Hard visible budget — `[plan todo:governor]` / F2. */
+function updateBudgetDisplay(remaining: number): void {
+  const el = shadowRoot?.querySelector('.xrc-budget') as HTMLElement | null;
+  if (!el) return;
+  el.textContent = remaining <= 0 ? 'Budget: 0 left' : `${remaining} left today`;
+  el.classList.toggle('xrc-budget-low', remaining > 0 && remaining <= 5);
+  el.classList.toggle('xrc-budget-blocked', remaining <= 0);
+}
+
+async function refreshGovernorStatus(): Promise<void> {
+  const handle = currentPost?.authorHandle;
+  if (!handle) return;
+  try {
+    const res = await sendExtensionMessage({ type: 'GET_GOVERNOR_STATUS', targetHandle: handle });
+    if (res.ok && res.governor) {
+      updateBudgetDisplay(res.governor.remainingBudget);
+      if (res.governor.nudge) showNudge(res.governor.nudge);
+    }
+  } catch {
+    /* budget display is best-effort */
   }
 }
 
@@ -548,7 +947,12 @@ async function selectSuggestion(index: number, insert: boolean): Promise<void> {
   if (!s || !currentPost) return;
   if (insert && isInserting) return;
 
-  void setLastServedSuggestion(currentPost.tweetId, s.text, index);
+  // F3: this write used to be `void`-ed, so the access-level rejection was invisible and
+  // `served:<tweetId>` silently never existed. The worker now grants content scripts access
+  // to session storage; if that ever regresses, this says so.
+  setLastServedSuggestion(currentPost.tweetId, s.text, index).catch((e: unknown) =>
+    console.warn('[XRC] could not record the served suggestion', e),
+  );
 
   if (insert) {
     isInserting = true;
@@ -588,27 +992,28 @@ function setupComposerWatchers(ctx: InstanceType<typeof ContentScriptContext>): 
     }
   };
 
-  ctx.addEventListener(document, 'focusin', checkFocus, true);
+  ctx.addEventListener(document, 'focusin', checkFocus, { capture: true });
   ctx.addEventListener(window, 'scroll', () => {
-    if (cardVisible) positionCard();
-  }, true);
+    if (cardVisible) schedulePositionCard();
+  }, { capture: true });
 
-  ctx.addEventListener(document, 'keydown', (e: KeyboardEvent) => {
-    if (e.key === 'Escape' && cardVisible) {
-      e.preventDefault();
+  ctx.addEventListener(document, 'keydown', (e) => {
+    const ke = e as KeyboardEvent;
+    if (ke.key === 'Escape' && cardVisible) {
+      ke.preventDefault();
       hideCard();
       return;
     }
 
-    if (!cardVisible || !isShortcutModifier(e)) return;
+    if (!cardVisible || !isShortcutModifier(ke)) return;
 
-    const key = e.key;
+    const key = ke.key;
     if (key === '1' || key === '2' || key === '3') {
-      e.preventDefault();
-      e.stopPropagation();
+      ke.preventDefault();
+      ke.stopPropagation();
       void selectSuggestion(Number(key) - 1, true);
     }
-  }, true);
+  }, { capture: true });
 }
 
 function setupReplyCapture(ctx: InstanceType<typeof ContentScriptContext>): void {
@@ -617,39 +1022,125 @@ function setupReplyCapture(ctx: InstanceType<typeof ContentScriptContext>): void
     const replyBtn = target.closest('[data-testid="reply"]');
     if (!replyBtn) return;
 
-    const tweet = replyBtn.closest('article[data-testid="tweet"]');
-    if (tweet) capturePostFromElement(tweet);
+    replyClickAt = now();
 
-    if (cardVisible || isComposerFocused()) {
-      void composeSuggestions();
-    }
-  }, true);
+    const tweet = replyBtn.closest('article[data-testid="tweet"]');
+    const captured = tweet ? capturePostFromElement(tweet) : false;
+    replyClickTweetId = currentPost?.tweetId ?? null;
+
+    // Was `if (cardVisible || isComposerFocused())`. Neither is true at click time — the
+    // composer has not opened yet — so compose was in practice driven by the later
+    // `focusin`, which is pure added delay on the one path where latency is visible.
+    // Still guarded on having a post: without one, `composeSuggestions` would only render
+    // "No post captured yet", and the composer that `findReplyTargetFromDom` needs does
+    // not exist this early.
+    if (captured || currentPost) void showCard();
+  }, { capture: true });
+}
+
+/**
+ * P5. The extension depends on TweetDetail above all else. If the user has a post open and
+ * it never arrives, that is breakage, and it says so rather than silently serving the
+ * poorer DOM path — which is what made F1 survivable for as long as it did.
+ */
+function armTweetDetailWatchdog(): void {
+  if (tweetDetailWatchdog !== null) {
+    clearTimeout(tweetDetailWatchdog);
+    tweetDetailWatchdog = null;
+  }
+
+  const match = window.location.pathname.match(/\/status\/(\d+)/);
+  if (!match?.[1]) return;
+  const tweetId = match[1];
+
+  tweetDetailWatchdog = setTimeout(() => {
+    tweetDetailWatchdog = null;
+    if (currentPost?.tweetId === tweetId && currentPost.source === 'graphql') return;
+
+    console.warn(
+      '[XRC GraphQL] no TweetDetail payload for the open post — degraded to the DOM path.',
+      {
+        tweetId,
+        interceptorAlive: graphqlHealth.interceptorAlive,
+        operationsSeen: graphqlHealth.seen,
+        drops: graphqlHealth.drops,
+      },
+    );
+    persistGraphqlHealth(
+      graphqlHealth.interceptorAlive ? 'tweet-detail-missing' : 'interceptor-silent',
+      tweetId,
+    );
+  }, TWEET_DETAIL_WATCHDOG_MS);
 }
 
 export default defineContentScript({
   matches: ['https://x.com/*', 'https://twitter.com/*'],
   runAt: 'document_idle',
   main(ctx) {
-    syncOwnHandle();
-    ctx.setInterval(syncOwnHandle, 5000);
+    logEntry('content script — ISOLATED world, document_idle', window.location.pathname);
 
     window.addEventListener('message', handleInterceptorMessage);
+
+    // F8: establish the shared nonce before replaying buffered GraphQL (and before identity).
+    postToMain({ type: 'init_channel', nonce: CHANNEL_NONCE });
+    // This script starts at document_idle; the interceptor starts at document_start. On a
+    // direct load of a /status/ URL, TweetDetail can land in that gap. Ask for a replay.
+    postToMain({ type: 'request_replay' });
+
+    syncOwnHandle();
     setupComposerWatchers(ctx);
     setupReplyCapture(ctx);
+    armTweetDetailWatchdog();
 
-    const observer = new MutationObserver(() => {
-      syncOwnHandle();
-      if (isComposerFocused() && !cardVisible) void showCard();
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+    if (!identityResolved()) {
+      identityInterval = setInterval(syncOwnHandle, 5000);
+      // Scoped to the chrome around the timeline rather than document.body: the handle and
+      // user id only ever appear in the nav, and the timeline is the part that mutates
+      // continuously while scrolling.
+      identityObserver = new MutationObserver(scheduleIdentitySync);
+      identityObserver.observe(
+        document.querySelector('header[role="banner"]') ??
+          document.querySelector('nav') ??
+          document.body,
+        { childList: true, subtree: true },
+      );
+    }
+
+    ctx.onInvalidated(stopIdentityWatchers);
+
     ctx.addEventListener(window, 'wxt:locationchange', () => {
-      currentPost = null;
-      isReading = false;
-      suggestions = [];
-      composeReady = false;
-      lastRefinement = undefined;
+      // Reply-from-timeline often SPA-navigates into /status/<sameId>. Key the click clock
+      // off `replyClickTweetId` (not `currentPost`) so a second locationchange after we
+      // null the post cannot wipe `clickToCardMs` (item 1 instrumentation).
+      const nextTweetId = window.location.pathname.match(/\/status\/(\d+)/)?.[1];
+      const keepSamePost =
+        currentPost != null &&
+        nextTweetId != null &&
+        nextTweetId === currentPost.tweetId;
+      const keepClickClock =
+        replyClickAt != null &&
+        replyClickTweetId != null &&
+        nextTweetId != null &&
+        nextTweetId === replyClickTweetId;
+
+      if (!keepSamePost) {
+        currentPost = null;
+        isReading = false;
+        suggestions = [];
+        composeReady = false;
+        lastRefinement = undefined;
+        postOpenAt = null;
+        composePrefetch = null;
+        hideCard();
+      }
+      if (!keepClickClock) {
+        replyClickAt = null;
+        replyClickTweetId = null;
+      }
       syncOwnHandle();
-      hideCard();
+      armTweetDetailWatchdog();
+      // Deliberately no replay here: the interceptor is already live for this navigation,
+      // and replaying its buffer would hand us the previous post's brief.
     });
   },
 });

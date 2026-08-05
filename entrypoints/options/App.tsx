@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 
-import type { Conditioning, Provider, StyleCard } from '../../lib/types';
+import type { Conditioning, Provider, StyleCard, StyleCardRegenSnapshot } from '../../lib/types';
 
 import { getSettings, saveSettings } from '../../lib/storage';
 
@@ -17,6 +17,8 @@ import {
 import { sendExtensionMessage } from '../../lib/messaging';
 
 import { validateApiKeyForProvider } from '../../lib/api-validation';
+
+import { getLastStyleRegen } from '../../lib/flywheel';
 
 
 
@@ -107,6 +109,13 @@ export default function App() {
 
   const [harvestEnabled, setHarvestEnabled] = useState(false);
 
+  const [remainingBudget, setRemainingBudget] = useState<number | null>(null);
+
+  /** replyCount for today — kept so raising the max updates "remaining of max" immediately. */
+  const [repliesUsedToday, setRepliesUsedToday] = useState(0);
+
+  const [styleRegen, setStyleRegen] = useState<StyleCardRegenSnapshot | null>(null);
+
 
 
   const providerMeta = PROVIDER_META[apiProvider];
@@ -150,6 +159,43 @@ export default function App() {
           e instanceof Error ? e.message : 'Could not read voice profile from local storage',
 
         );
+
+      }
+
+      try {
+
+        const gov = await sendExtensionMessage({ type: 'GET_GOVERNOR_STATUS', targetHandle: '' });
+
+        if (gov.ok && gov.governor) {
+          setRemainingBudget(gov.governor.remainingBudget);
+          setRepliesUsedToday(
+            Math.max(0, settings.dailyReplyBudget - gov.governor.remainingBudget),
+          );
+        }
+
+      } catch {
+
+        /* governor display is best-effort */
+
+      }
+
+      try {
+
+        const regen = await getLastStyleRegen();
+
+        if (regen) setStyleRegen(regen);
+
+        else {
+
+          const viaSw = await sendExtensionMessage({ type: 'GET_LAST_STYLE_REGEN' });
+
+          if (viaSw.ok && viaSw.styleRegen) setStyleRegen(viaSw.styleRegen);
+
+        }
+
+      } catch {
+
+        /* before/after is optional until the 50th posted reply */
 
       }
 
@@ -369,6 +415,19 @@ export default function App() {
 
 
 
+  const refreshRemainingBudget = useCallback(async (budgetMax?: number) => {
+    try {
+      const gov = await sendExtensionMessage({ type: 'GET_GOVERNOR_STATUS', targetHandle: '' });
+      if (gov.ok && gov.governor) {
+        setRemainingBudget(gov.governor.remainingBudget);
+        const max = budgetMax ?? dailyBudget;
+        setRepliesUsedToday(Math.max(0, max - gov.governor.remainingBudget));
+      }
+    } catch {
+      /* governor display is best-effort */
+    }
+  }, [dailyBudget]);
+
   const finishOnboarding = useCallback(async () => {
 
     await saveSettings({
@@ -381,9 +440,23 @@ export default function App() {
 
     });
 
+    // Governor reads budget from storage — refresh after save or Ready shows stale
+    // remaining from the previous max (e.g. "50 of 100" after raising 50→100).
+    await refreshRemainingBudget(dailyBudget);
+
     setStep('done');
 
-  }, [conditioning, dailyBudget]);
+  }, [conditioning, dailyBudget, refreshRemainingBudget]);
+
+  const saveDailyBudget = useCallback(async (value: number) => {
+    const next = Number.isFinite(value) ? Math.min(200, Math.max(5, Math.round(value))) : 50;
+    setDailyBudget(next);
+    await saveSettings({ dailyReplyBudget: next });
+    await refreshRemainingBudget(next);
+  }, [refreshRemainingBudget]);
+
+  const displayedRemaining =
+    remainingBudget === null ? null : Math.max(0, dailyBudget - repliesUsedToday);
 
 
 
@@ -836,6 +909,40 @@ export default function App() {
 
 
 
+          <label>
+
+            Daily reply budget
+
+            <input
+
+              type="number"
+
+              min={5}
+
+              max={200}
+
+              value={dailyBudget}
+
+              onChange={(e) => setDailyBudget(Number(e.target.value))}
+
+              onBlur={(e) => void saveDailyBudget(Number(e.target.value))}
+
+            />
+
+          </label>
+
+          {displayedRemaining !== null && (
+
+            <p className="corpus-count" aria-live="polite">
+
+              Daily reply budget remaining: <strong>{displayedRemaining}</strong> of {dailyBudget}
+
+            </p>
+
+          )}
+
+
+
           <label className="checkbox-row">
 
             <input
@@ -861,6 +968,34 @@ export default function App() {
               <h3>Current StyleCard</h3>
 
               <pre>{formatStyleCardSummary(styleCard)}</pre>
+
+            </div>
+
+          )}
+
+
+
+          {styleRegen && (
+
+            <div className="style-card">
+
+              <h3>StyleCard before / after (last ~50-post regen)</h3>
+
+              <p className="subtitle">
+
+                Regenerated at {new Date(styleRegen.at).toLocaleString()} after{' '}
+
+                {styleRegen.postedDiffCount} posted replies.
+
+              </p>
+
+              <h4>Before</h4>
+
+              <pre>{formatStyleCardSummary(styleRegen.previous)}</pre>
+
+              <h4>After</h4>
+
+              <pre>{styleRegen.summary || formatStyleCardSummary(styleRegen.current)}</pre>
 
             </div>
 

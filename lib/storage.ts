@@ -57,6 +57,15 @@ export async function setCachedSuggestions(tweetId: string, suggestions: unknown
   await setSessionCache(`suggestions:${tweetId}`, { suggestions, timestamp: Date.now() });
 }
 
+/** Drop stale drafts when Stage 1 is re-run with richer media/reply context. */
+export async function clearCachedSuggestions(tweetId: string): Promise<void> {
+  try {
+    await chrome.storage.session.remove(`suggestions:${tweetId}`);
+  } catch {
+    /* session may be unavailable in some build-time shims */
+  }
+}
+
 export async function getLastServedSuggestion(tweetId: string): Promise<{ text: string; index: number } | undefined> {
   return getSessionCache(`served:${tweetId}`);
 }

@@ -1,4 +1,4 @@
-import type { ComprehendResult, ComposeRequest, PostBrief } from './types';
+import type { ComprehendResult, ComposeRequest, MediaItem, PostBrief } from './types';
 import type { ApiKeyValidation } from './api-validation';
 import {
   buildComprehendPrompt,
@@ -8,6 +8,14 @@ import {
 } from './prompts';
 import type { VerbalizedCandidate } from './types';
 import { recordGenerationFailure, recordGenerationRecovery, RAW_PREVIEW_CHARS } from './debug';
+import {
+  combineMediaDescriptions,
+  fallbackDescriptionForMedia,
+  MEDIA_UNREADABLE,
+  selectMediaForDescription,
+  visionPromptForMedia,
+} from './media';
+import { postBriefHasVisualMedia } from './post-brief';
 
 /** Vision model for image comprehend (Groq multimodal). */
 export const GROQ_VISION_MODEL = 'qwen/qwen3.6-27b';
@@ -174,46 +182,72 @@ async function fetchImageAsDataUrl(url: string): Promise<string | null> {
   }
 }
 
+async function describeOneMediaItem(apiKey: string, item: MediaItem): Promise<string> {
+  if (item.altText) return item.altText;
+  if (!item.url) return fallbackDescriptionForMedia(item);
+
+  const dataUrl = await fetchImageAsDataUrl(item.url);
+  if (!dataUrl) return fallbackDescriptionForMedia(item);
+
+  try {
+    return (
+      await callGroqModel(
+        apiKey,
+        GROQ_VISION_MODEL,
+        [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: visionPromptForMedia(item) },
+              { type: 'image_url', image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+        100,
+        false,
+      )
+    ).trim();
+  } catch {
+    return fallbackDescriptionForMedia(item);
+  }
+}
+
 /** Stage 1: multimodal comprehend — cached by tweet ID in session storage. */
 export async function comprehendPost(apiKey: string, postBrief: PostBrief): Promise<ComprehendResult> {
-  let imageDescription = '';
+  const totalVisual = postBrief.media.filter(
+    (m) => m.type === 'photo' || m.type === 'video' || m.type === 'animated_gif',
+  ).length;
+  const toDescribe = selectMediaForDescription(postBrief.media);
+  const described = await Promise.all(
+    toDescribe.map(async (item, index) => {
+      const text = await describeOneMediaItem(apiKey, item);
+      return text ? { index, text } : null;
+    }),
+  );
+  const perItem = described.filter((d): d is { index: number; text: string } => d != null);
 
-  const photo = postBrief.media.find((m) => m.type === 'photo' || m.type === 'animated_gif');
-  if (photo?.altText) {
-    imageDescription = photo.altText;
-  } else if (photo?.url) {
-    const dataUrl = await fetchImageAsDataUrl(photo.url);
-    if (dataUrl) {
-      try {
-        imageDescription = await callGroqModel(
-          apiKey,
-          GROQ_VISION_MODEL,
-          [
-            {
-              role: 'user',
-              content: [
-                { type: 'text', text: 'Describe this image in one sentence for reply context. Output plain text only.' },
-                { type: 'image_url', image_url: { url: dataUrl } },
-              ],
-            },
-          ],
-          100,
-          false,
-        );
-      } catch {
-        imageDescription = '';
-      }
-    }
-  }
-
-  const video = postBrief.media.find((m) => m.type === 'video');
-  if (!imageDescription && video) {
-    imageDescription = video.altText ?? 'Video post (poster frame only)';
+  let imageDescription = combineMediaDescriptions(perItem, totalVisual);
+  if (!imageDescription && postBriefHasVisualMedia(postBrief)) {
+    imageDescription = MEDIA_UNREADABLE;
   }
 
   const prompt = buildComprehendPrompt(postBrief, imageDescription);
   const raw = await callGroqText(apiKey, [{ role: 'user', content: prompt }], 300, true);
   const parsed = parseComprehendJson(raw);
+
+  // F10: mirror Gemini — surface parse failure instead of caching a silent fallback.
+  if (!parsed) {
+    recordGenerationFailure({
+      at: new Date().toISOString(),
+      stage: 'comprehend',
+      provider: 'groq',
+      model: activeTextModel,
+      route: 'chat/completions',
+      rawLength: raw.length,
+      rawPreview: raw.slice(0, RAW_PREVIEW_CHARS),
+      error: 'Comprehend JSON unparseable — falling back to post text',
+    });
+  }
 
   return {
     claim: String(parsed?.claim ?? postBrief.text.slice(0, 120)),
@@ -226,6 +260,7 @@ export async function comprehendPost(apiKey: string, postBrief: PostBrief): Prom
       : postBrief.topReplies.slice(0, 6).map((r) => r.text.slice(0, 80)),
     tweetId: postBrief.tweetId,
     cachedAt: Date.now(),
+    degraded: !parsed,
   };
 }
 
