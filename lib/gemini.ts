@@ -2,6 +2,8 @@ import type { ComprehendResult, ComposeRequest, MediaItem, PostBrief } from './t
 import type { ApiKeyValidation } from './api-validation';
 import {
   buildComprehendPrompt,
+  buildComposeCachePrefix,
+  buildComposeDynamicSuffix,
   buildComposePrompt,
   parseCandidatesWithDiagnostics,
   parseComprehendJson,
@@ -21,14 +23,24 @@ import {
   visionPromptForMedia,
 } from './media';
 import { postBriefHasVisualMedia } from './post-brief';
+import { getSettings } from './storage';
+import { ensureComposeCache } from './gemini-cache';
+import { parseUsagePayload, recordUsage, type UsageStage } from './usage';
 
-/** Preference order when multiple flash models are available (newest/cheapest first). */
+/**
+ * Preference order when multiple flash models are available.
+ * Default #1 is 3.1-flash-lite — 2.5-flash-lite is omitted (unavailable on newer accounts).
+ */
 export const GEMINI_MODELS = [
-  'gemini-2.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-3.5-flash-lite',
   'gemini-2.5-flash',
   'gemini-2.0-flash-lite',
   'gemini-2.0-flash',
 ] as const;
+
+/** Models removed from the product UI; migrate stored pins away from these. */
+export const RETIRED_GEMINI_MODELS = ['gemini-2.5-flash-lite'] as const;
 
 export type GeminiAuthMode = 'query-key' | 'x-goog-api-key' | 'bearer' | 'interactions';
 
@@ -477,8 +489,15 @@ function interactionsThinkingConfig(): Record<string, unknown> {
 }
 
 function generateContentThinkingConfig(model: string): Record<string, unknown> | null {
-  // thinkingBudget is the 2.5-series control; 3.x models use thinkingLevel and cannot disable it.
-  return /gemini-2\.5/.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : null;
+  // 2.5-series: thinkingBudget 0 disables thinking (R4 — keep untouched on happy path).
+  if (/gemini-2\.5/.test(model)) {
+    return { thinkingConfig: { thinkingBudget: 0 } };
+  }
+  // 3.x: cannot fully disable; thinkingLevel minimal matches "no thinking" for most queries.
+  if (/gemini-3/.test(model)) {
+    return { thinkingConfig: { thinkingLevel: 'minimal' } };
+  }
+  return null;
 }
 
 /**
@@ -620,9 +639,10 @@ async function postGenerateContent(
   jsonMode: boolean,
   withThinkingControl: boolean,
   preferredAuth?: GeminiAuthMode,
+  cachedContentName?: string,
 ): Promise<GenerationResult> {
   const thinking = withThinkingControl ? generateContentThinkingConfig(model) : null;
-  const body = JSON.stringify({
+  const bodyObj: Record<string, unknown> = {
     contents: [{ parts: resolvedParts }],
     generationConfig: {
       temperature: 1.0,
@@ -630,7 +650,11 @@ async function postGenerateContent(
       ...(jsonMode ? { responseMimeType: 'application/json' } : {}),
       ...(thinking ?? {}),
     },
-  });
+  };
+  if (cachedContentName) {
+    bodyObj.cachedContent = cachedContentName;
+  }
+  const body = JSON.stringify(bodyObj);
 
   const { response, authMode } = await geminiFetchWithAuth(
     apiKey,
@@ -696,6 +720,7 @@ async function callGeminiGenerateContent(
   maxTokens: number,
   jsonMode: boolean,
   preferredAuth?: GeminiAuthMode,
+  cachedContentName?: string,
 ): Promise<GenerationResult> {
   const resolvedParts = await resolvePartsForGenerateContent(parts);
   try {
@@ -707,6 +732,7 @@ async function callGeminiGenerateContent(
       jsonMode,
       true,
       preferredAuth,
+      cachedContentName,
     );
   } catch (e) {
     const err = e as GeminiCallError;
@@ -724,6 +750,7 @@ async function callGeminiGenerateContent(
       jsonMode,
       false,
       preferredAuth,
+      cachedContentName,
     );
   }
 }
@@ -731,6 +758,7 @@ async function callGeminiGenerateContent(
 /**
  * Unified text generation for one model: generateContent auth modes, then Interactions.
  * AQ keys prefer Interactions first for text-only (generateContent often 404s).
+ * When cachedContentName is set, only generateContent is used (Interactions has no cachedContents).
  */
 async function generateTextWithModel(
   apiKey: string,
@@ -739,11 +767,13 @@ async function generateTextWithModel(
   maxTokens: number,
   jsonMode: boolean,
   preferredAuth?: GeminiAuthMode,
+  cachedContentName?: string,
 ): Promise<GenerationResult> {
   const multimodal = hasMultimodalInput(parts);
   const aqKey = isAuthKey(apiKey);
-  const attempts: Array<'interactions' | 'generateContent'> =
-    aqKey || preferredAuth === 'interactions'
+  const attempts: Array<'interactions' | 'generateContent'> = cachedContentName
+    ? ['generateContent']
+    : aqKey || preferredAuth === 'interactions'
       ? ['interactions', 'generateContent']
       : ['generateContent', 'interactions'];
 
@@ -759,7 +789,15 @@ async function generateTextWithModel(
         return result;
       }
 
-      const result = await callGeminiGenerateContent(apiKey, model, parts, maxTokens, jsonMode, preferredAuth);
+      const result = await callGeminiGenerateContent(
+        apiKey,
+        model,
+        parts,
+        maxTokens,
+        jsonMode,
+        preferredAuth,
+        cachedContentName,
+      );
       return result;
     } catch (e) {
       lastError = e as GeminiCallError;
@@ -782,6 +820,7 @@ async function callGeminiModel(
   parts: GeminiPart[],
   maxTokens = DEFAULT_MAX_TOKENS,
   jsonMode = true,
+  cachedContentName?: string,
 ): Promise<GenerationResult> {
   const prefs = await loadGeminiPrefs();
   const result = await generateTextWithModel(
@@ -791,6 +830,7 @@ async function callGeminiModel(
     maxTokens,
     jsonMode,
     prefs.authMode,
+    cachedContentName,
   );
   await persistGeminiPrefs(model, result.meta.authMode);
   return result;
@@ -823,6 +863,7 @@ export async function discoverModels(apiKey: string): Promise<string[]> {
   for (const entry of data.models ?? []) {
     const shortName = shortModelName(entry.name);
     if (!shortName || !isFlashModel(shortName)) continue;
+    if ((RETIRED_GEMINI_MODELS as readonly string[]).includes(shortName)) continue;
     if (!modelSupportsGeneration(entry)) continue;
     flashModels.push(shortName);
   }
@@ -836,6 +877,20 @@ async function listAvailableFlashModels(apiKey: string): Promise<string[]> {
 }
 
 async function resolveModelOrder(apiKey: string): Promise<string[]> {
+  // Options pin wins: no silent cascade to slower models (honest A/B latency tests).
+  const settings = await getSettings();
+  const pinned = settings.geminiModel?.trim();
+  if (pinned) {
+    activeModel = pinned;
+    const prefs = await loadGeminiPrefs();
+    if (prefs.model !== pinned) {
+      await chrome.storage.local.set({ preferredGeminiModel: pinned });
+    }
+    cachedModelOrder = [pinned];
+    cachedModelOrderKey = apiKey;
+    return [pinned];
+  }
+
   if (cachedModelOrder && cachedModelOrderKey === apiKey) {
     return cachedModelOrder;
   }
@@ -872,6 +927,12 @@ async function resolveModelOrder(apiKey: string): Promise<string[]> {
   return order;
 }
 
+/** Drop in-memory discovery so the next call re-reads settings / ListModels. */
+export function clearGeminiModelOrderCache(): void {
+  cachedModelOrder = null;
+  cachedModelOrderKey = '';
+}
+
 export function getActiveGeminiModel(): string {
   return activeModel;
 }
@@ -906,13 +967,17 @@ async function callGemini(
   parts: GeminiPart[],
   maxTokens = DEFAULT_MAX_TOKENS,
   jsonMode = true,
+  stage: UsageStage = 'other',
 ): Promise<GenerationResult> {
   const deadline = Date.now() + COMPOSE_WALL_CLOCK_MS;
   const discovered = await resolveModelOrder(apiKey);
   const models = [
     ...(discovered.includes(activeModel) ? [activeModel] : []),
     ...discovered.filter((m) => m !== activeModel),
-    ...GEMINI_MODELS.filter((m) => !discovered.includes(m) && m !== activeModel),
+    // When a model is pinned via settings, resolveModelOrder is length-1 — do not append fallbacks.
+    ...(discovered.length === 1
+      ? []
+      : GEMINI_MODELS.filter((m) => !discovered.includes(m) && m !== activeModel)),
   ];
 
   let lastError: GeminiCallError | null = null;
@@ -927,15 +992,39 @@ async function callGemini(
     try {
       const result = await callGeminiModel(apiKey, model, parts, maxTokens, jsonMode);
       activeModel = model;
+      await trackGenerationUsage(result, stage);
       return result;
     } catch (e) {
       lastError = e as GeminiCallError;
       if (lastError.status === 401 || lastError.status === 403) throw lastError;
       if (lastError.status === 429) throw lastError;
+      // Pinned single-model: surface the error instead of cascading.
+      if (discovered.length === 1) break;
     }
   }
 
   throw new Error(formatLastError(lastError, discovered));
+}
+
+async function trackGenerationUsage(result: GenerationResult, stage: UsageStage): Promise<void> {
+  const tokens = parseUsagePayload(result.meta.usage);
+  if (
+    tokens.inputTokens === 0 &&
+    tokens.outputTokens === 0 &&
+    tokens.thinkingTokens === 0 &&
+    tokens.cachedInputTokens === 0
+  ) {
+    return;
+  }
+  try {
+    await recordUsage({
+      model: result.meta.model,
+      stage,
+      ...tokens,
+    });
+  } catch (e) {
+    console.warn('[Gemini] usage ledger write failed', e);
+  }
 }
 
 function formatModelLabel(model: string): string {
@@ -955,8 +1044,11 @@ function authModeLabel(mode: GeminiAuthMode): string {
   }
 }
 
-/** Validate API key — performs a real 1-token generation via the same path as compose. */
-export async function validateApiKey(apiKey: string): Promise<ApiKeyValidation> {
+/** Validate API key — performs a real generation via the same path as compose. */
+export async function validateApiKey(
+  apiKey: string,
+  preferredModel?: string,
+): Promise<ApiKeyValidation> {
   const trimmed = apiKey.trim();
   if (!isGeminiKeyFormat(trimmed)) {
     return {
@@ -969,14 +1061,18 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyValidation> 
   cachedModelOrderKey = '';
 
   const prefs = await loadGeminiPrefs();
+  const settings = await getSettings();
+  const pinned = preferredModel?.trim() || settings.geminiModel?.trim() || prefs.model;
   const discovered = await discoverModels(trimmed);
 
   if (discovered.length > 0) {
     await persistDiscoveredModels(discovered);
   }
 
-  const modelsToTry =
-    discovered.length > 0
+  // When the user pinned a model in Options, validate that model only.
+  const modelsToTry = pinned
+    ? [pinned]
+    : discovered.length > 0
       ? prefs.model && discovered.includes(prefs.model)
         ? [prefs.model, ...discovered.filter((m) => m !== prefs.model)]
         : discovered
@@ -993,8 +1089,15 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyValidation> 
     try {
       // Not 4 tokens: a thinking model can spend a tiny budget entirely on thoughts and
       // return nothing, which would read as an invalid key.
-      await callGeminiModel(trimmed, model, [{ text: 'Reply with the word ok.' }], 256, false);
+      const result = await callGeminiModel(
+        trimmed,
+        model,
+        [{ text: 'Reply with the word ok.' }],
+        256,
+        false,
+      );
       activeModel = model;
+      await trackGenerationUsage(result, 'validate');
 
       const stored = await loadGeminiPrefs();
       const authHint = stored.authMode ? ` via ${authModeLabel(stored.authMode)}` : '';
@@ -1032,7 +1135,9 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyValidation> 
 
   return {
     valid: false,
-    message: formatLastError(lastError, discovered),
+    message: pinned
+      ? `Pinned model ${pinned} is not available on this key. ${formatLastError(lastError, discovered)}`
+      : formatLastError(lastError, discovered),
   };
 }
 
@@ -1075,6 +1180,7 @@ async function describeOneMediaItem(apiKey: string, item: MediaItem): Promise<st
         [{ text: describePrompt }, { imageUri: item.url, imageMimeType: 'image/webp' }],
         VISION_MAX_TOKENS,
         false,
+        'vision',
       )
     ).text.trim();
   } catch (e) {
@@ -1088,6 +1194,7 @@ async function describeOneMediaItem(apiKey: string, item: MediaItem): Promise<st
           [{ text: describePrompt }, { inlineData: imageData }],
           VISION_MAX_TOKENS,
           false,
+          'vision',
         )
       ).text.trim();
     } catch (inlineErr) {
@@ -1126,7 +1233,13 @@ export async function comprehendPost(apiKey: string, postBrief: PostBrief): Prom
   });
 
   const prompt = buildComprehendPrompt(postBrief, imageDescription);
-  const { text: raw, meta } = await callGemini(apiKey, [{ text: prompt }], COMPREHEND_MAX_TOKENS);
+  const { text: raw, meta } = await callGemini(
+    apiKey,
+    [{ text: prompt }],
+    COMPREHEND_MAX_TOKENS,
+    true,
+    'comprehend',
+  );
   const parsed = parseComprehendJson(raw);
 
   // Comprehend degrades to defaults on a parse miss, so this would otherwise fail invisibly.
@@ -1186,9 +1299,46 @@ function composeFailureMessage(raw: string, meta: GenerationMeta, truncated: boo
 
 /** Stage 2: text-only compose with verbalized sampling k=5. */
 export async function composeReplies(apiKey: string, req: ComposeRequest): Promise<VerbalizedCandidate[]> {
+  const prefix = buildComposeCachePrefix(req);
+  const suffix = buildComposeDynamicSuffix(req);
   const prompt = buildComposePrompt(req);
-  // jsonMode off: free-form output plus layered parsing tolerates every shape the model returns.
-  const { text: raw, meta } = await callGemini(apiKey, [{ text: prompt }], COMPOSE_MAX_TOKENS, false);
+
+  const models = await resolveModelOrder(apiKey);
+  const model = models[0] ?? activeModel;
+
+  let result: GenerationResult | null = null;
+  let usedCache = false;
+
+  try {
+    const cache = await ensureComposeCache(apiKey, model, prefix);
+    if (cache) {
+      try {
+        result = await callGeminiModel(
+          apiKey,
+          model,
+          [{ text: suffix }],
+          COMPOSE_MAX_TOKENS,
+          false,
+          cache.name,
+        );
+        activeModel = model;
+        await trackGenerationUsage(result, 'compose');
+        usedCache = true;
+        console.info(`[Gemini] compose via cachedContent ${cache.name}`);
+      } catch (cacheErr) {
+        console.warn('[Gemini] cached compose failed; falling back to full prompt', cacheErr);
+      }
+    }
+  } catch (e) {
+    console.info('[Gemini cache] ensureComposeCache threw; using full prompt', e);
+  }
+
+  if (!result) {
+    // jsonMode off: free-form output plus layered parsing tolerates every shape the model returns.
+    result = await callGemini(apiKey, [{ text: prompt }], COMPOSE_MAX_TOKENS, false, 'compose');
+  }
+
+  const { text: raw, meta } = result;
   const parsed = parseCandidatesWithDiagnostics(raw);
 
   const debugBase = {
@@ -1200,6 +1350,7 @@ export async function composeReplies(apiKey: string, req: ComposeRequest): Promi
     promptChars: prompt.length,
     rawLength: raw.length,
     rawPreview: raw.slice(0, RAW_PREVIEW_CHARS),
+    error: usedCache ? 'compose used createCachedContent prefix' : undefined,
   };
 
   if (parsed.candidates.length === 0) {
@@ -1213,7 +1364,15 @@ export async function composeReplies(apiKey: string, req: ComposeRequest): Promi
   }
 
   if (parsed.strategy !== 'strict-json') {
-    recordGenerationRecovery({ ...debugBase, error: `recovered ${parsed.candidates.length} via ${parsed.strategy}` });
+    recordGenerationRecovery({
+      ...debugBase,
+      error: `recovered ${parsed.candidates.length} via ${parsed.strategy}`,
+    });
+  } else if (usedCache) {
+    recordGenerationRecovery({
+      ...debugBase,
+      error: 'compose used createCachedContent prefix',
+    });
   }
 
   return parsed.candidates;

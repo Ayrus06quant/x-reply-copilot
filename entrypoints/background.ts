@@ -34,6 +34,9 @@ import { canCompose, checkShapeVariance, recordReplyToAccount, getGovernorStatus
 import { getAiProvider } from '../lib/provider';
 import { validateApiKeyForProvider } from '../lib/api-validation';
 import { logEntry, now, recordPipelineTiming, since, type PipelineTiming } from '../lib/perf';
+import { getUsageSummary, resetUsage } from '../lib/usage';
+import { invalidateComposeCache } from '../lib/gemini-cache';
+import { clearGeminiModelOrderCache } from '../lib/gemini';
 
 const COMPREHEND_PREFIX = 'comprehend:';
 
@@ -133,6 +136,18 @@ function comprehendIsStale(cached: ComprehendResult, postBrief: PostBrief): bool
   );
 }
 
+async function withUsageSummary(
+  response: ExtensionResponse,
+): Promise<ExtensionResponse> {
+  if (!response.ok) return response;
+  try {
+    const usageSummary = await getUsageSummary();
+    return { ...response, usageSummary };
+  } catch {
+    return response;
+  }
+}
+
 async function handleComprehend(
   postBrief: PostBrief,
   providerOverride?: Provider,
@@ -142,7 +157,7 @@ async function handleComprehend(
   const cached = await getSessionCache<ComprehendResult>(cacheKey);
 
   if (cached && !comprehendIsStale(cached, postBrief)) {
-    return {
+    return withUsageSummary({
       ok: true,
       comprehend: cached,
       timing: {
@@ -153,7 +168,7 @@ async function handleComprehend(
         comprehendMs: since(startedAt),
         topReplyCount: postBrief.topReplies.length,
       },
-    };
+    });
   }
 
   if (cached) {
@@ -189,7 +204,7 @@ async function handleComprehend(
     };
     recordPipelineTiming(timing);
 
-    return { ok: true, comprehend, timing };
+    return withUsageSummary({ ok: true, comprehend, timing });
   } catch (e) {
     console.error('[X Reply Copilot] comprehend failed', e);
     return { ok: false, error: e instanceof Error ? e.message : 'Comprehend failed' };
@@ -261,12 +276,12 @@ async function runCompose(
         topReplyCount: postBrief.topReplies.length,
       };
       recordPipelineTiming(timing);
-      return {
+      return withUsageSummary({
         ok: true,
         suggestions: cachedSuggestions,
         governor: governor.status,
         timing,
-      };
+      });
     }
   }
 
@@ -342,7 +357,7 @@ async function runCompose(
     };
     recordPipelineTiming(timing);
 
-    return { ok: true, suggestions, governor: governor.status, comprehend, timing };
+    return withUsageSummary({ ok: true, suggestions, governor: governor.status, comprehend, timing });
   } catch (e) {
     console.error('[X Reply Copilot] compose failed', e);
     return { ok: false, error: e instanceof Error ? e.message : 'Compose failed' };
@@ -410,7 +425,8 @@ async function handleExtensionMessage(message: unknown): Promise<ExtensionRespon
 
     case 'VALIDATE_API_KEY': {
       const provider = await resolveProvider(msg.provider);
-      const result = await validateApiKeyForProvider(provider, msg.apiKey);
+      clearGeminiModelOrderCache();
+      const result = await validateApiKeyForProvider(provider, msg.apiKey, msg.geminiModel);
       return {
         ok: true,
         valid: result.valid,
@@ -418,6 +434,16 @@ async function handleExtensionMessage(message: unknown): Promise<ExtensionRespon
         validationWarning: result.warning,
         validationModel: result.model,
       };
+    }
+
+    case 'GET_USAGE_SUMMARY': {
+      const usageSummary = await getUsageSummary();
+      return { ok: true, usageSummary };
+    }
+
+    case 'RESET_USAGE': {
+      const usageSummary = await resetUsage();
+      return { ok: true, usageSummary };
     }
 
     case 'COMPREHEND':
@@ -450,6 +476,7 @@ async function handleExtensionMessage(message: unknown): Promise<ExtensionRespon
 
       if (added > 0) {
         await rebuildStyleCardFromCorpus(msg.replies[0]?.handle);
+        await invalidateComposeCache(settings.apiKey);
       }
 
       const corpusCount = await getCorpusCount();
@@ -457,8 +484,10 @@ async function handleExtensionMessage(message: unknown): Promise<ExtensionRespon
     }
 
     case 'IMPORT_MANUAL_REPLIES': {
+      const settings = await getSettings();
       const added = await importManualReplies(msg.text, msg.handle);
       await rebuildStyleCardFromCorpus(msg.handle);
+      await invalidateComposeCache(settings.apiKey);
       const corpusCount = await getCorpusCount();
       return { ok: true, added, corpusCount };
     }

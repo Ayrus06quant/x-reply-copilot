@@ -1,17 +1,53 @@
 import { useCallback, useEffect, useState } from 'react';
 
-import type { Conditioning, Provider, StyleCard, StyleCardRegenSnapshot } from '../../lib/types';
+import type {
+
+  Conditioning,
+
+  Provider,
+
+  StyleCard,
+
+  StyleCardRegenSnapshot,
+
+  UsageSummary,
+
+} from '../../lib/types';
+
+import { SELECTABLE_GEMINI_MODELS } from '../../lib/types';
+
+import {
+
+  formatUsd,
+
+  getUsageSummary,
+
+  PRICING_STAMP,
+
+  resetUsage,
+
+} from '../../lib/usage';
+
+import { invalidateComposeCache } from '../../lib/gemini-cache';
+
+import { clearGeminiModelOrderCache } from '../../lib/gemini';
 
 import { getSettings, saveSettings } from '../../lib/storage';
 
 import { formatStyleCardSummary } from '../../lib/style-card';
 
 import {
+
   readStyleCardDirect,
+
   rebuildStyleCardFromCorpus,
+
   getCorpusCount,
+
   importManualReplies,
+
   clearVoiceData,
+
 } from '../../lib/corpus';
 
 import { sendExtensionMessage } from '../../lib/messaging';
@@ -22,7 +58,15 @@ import { getLastStyleRegen } from '../../lib/flywheel';
 
 
 
+
+
+
+
 type Step = 'key' | 'calibrate' | 'condition' | 'done';
+
+
+
+
 
 
 
@@ -43,6 +87,7 @@ const PROVIDER_META: Record<
     keyUrl: 'https://aistudio.google.com/apikey',
 
     keyHint:
+
       'Google AI Studio now issues AQ. auth keys for new accounts (legacy keys start with AIza). Use a paid key if you want to avoid free-tier data use. Typical cost ~$0.50/month.',
 
     disclosure: 'Content is sent to Google Gemini using your API key.',
@@ -64,6 +109,10 @@ const PROVIDER_META: Record<
   },
 
 };
+
+
+
+
 
 
 
@@ -112,13 +161,28 @@ export default function App() {
   const [remainingBudget, setRemainingBudget] = useState<number | null>(null);
 
   /** replyCount for today — kept so raising the max updates "remaining of max" immediately. */
+
   const [repliesUsedToday, setRepliesUsedToday] = useState(0);
 
   const [styleRegen, setStyleRegen] = useState<StyleCardRegenSnapshot | null>(null);
 
+  const [geminiModel, setGeminiModel] = useState<string>('gemini-3.1-flash-lite');
+
+  const [usage, setUsage] = useState<UsageSummary | null>(null);
+
+  const [resettingUsage, setResettingUsage] = useState(false);
+
+
+
+
+
 
 
   const providerMeta = PROVIDER_META[apiProvider];
+
+
+
+
 
 
 
@@ -132,6 +196,8 @@ export default function App() {
 
       if (settings.apiKey) setApiKey(settings.apiKey);
 
+      setGeminiModel(settings.geminiModel ?? 'gemini-3.1-flash-lite');
+
       if (settings.conditioning) setConditioning(settings.conditioning);
 
       setDailyBudget(settings.dailyReplyBudget);
@@ -141,6 +207,20 @@ export default function App() {
       if (settings.onboardingComplete) setStep('done');
 
       else if (settings.apiKey) setStep('calibrate');
+
+      try {
+
+        setUsage(await getUsageSummary());
+
+      } catch {
+
+        /* usage dashboard is best-effort */
+
+      }
+
+
+
+
 
 
 
@@ -167,10 +247,15 @@ export default function App() {
         const gov = await sendExtensionMessage({ type: 'GET_GOVERNOR_STATUS', targetHandle: '' });
 
         if (gov.ok && gov.governor) {
+
           setRemainingBudget(gov.governor.remainingBudget);
+
           setRepliesUsedToday(
+
             Math.max(0, settings.dailyReplyBudget - gov.governor.remainingBudget),
+
           );
+
         }
 
       } catch {
@@ -205,6 +290,10 @@ export default function App() {
 
 
 
+
+
+
+
   const validateKey = useCallback(async () => {
 
     const trimmedKey = apiKey.trim();
@@ -221,6 +310,10 @@ export default function App() {
 
 
 
+
+
+
+
     setValidating(true);
 
     setKeyValid(null);
@@ -231,11 +324,19 @@ export default function App() {
 
 
 
+
+
+
+
     try {
 
       // Validate directly from Options page — works when service worker is inactive (MV3).
 
-      const result = await validateApiKeyForProvider(apiProvider, trimmedKey);
+      const result = await validateApiKeyForProvider(apiProvider, trimmedKey, geminiModel);
+
+
+
+
 
 
 
@@ -247,9 +348,35 @@ export default function App() {
 
 
 
+
+
+
+
       if (result.valid) {
 
-        await saveSettings({ apiKey: trimmedKey, apiProvider });
+        clearGeminiModelOrderCache();
+
+        await invalidateComposeCache(trimmedKey);
+
+        await saveSettings({
+
+          apiKey: trimmedKey,
+
+          apiProvider,
+
+          geminiModel: apiProvider === 'gemini' ? geminiModel : undefined,
+
+        });
+
+        try {
+
+          setUsage(await getUsageSummary());
+
+        } catch {
+
+          /* ignore */
+
+        }
 
         setStep('calibrate');
 
@@ -267,7 +394,11 @@ export default function App() {
 
     }
 
-  }, [apiKey, apiProvider, providerMeta.label]);
+  }, [apiKey, apiProvider, geminiModel, providerMeta.label]);
+
+
+
+
 
 
 
@@ -279,6 +410,10 @@ export default function App() {
 
 
 
+
+
+
+
     try {
 
       const count = await getCorpusCount();
@@ -287,9 +422,15 @@ export default function App() {
 
       const card = await rebuildStyleCardFromCorpus();
 
+      await invalidateComposeCache(apiKey);
+
       setStyleCard(card);
 
       setCorpusCount(card.corpusSize);
+
+
+
+
 
 
 
@@ -321,6 +462,10 @@ export default function App() {
 
 
 
+
+
+
+
   const importManual = useCallback(async () => {
 
     const handle = manualHandle.trim() || styleCard?.sampleHandle?.trim();
@@ -343,9 +488,17 @@ export default function App() {
 
 
 
+
+
+
+
     setImportingManual(true);
 
     setManualImportMessage(null);
+
+
+
+
 
 
 
@@ -383,54 +536,97 @@ export default function App() {
 
 
 
+
+
+
+
   const clearVoice = useCallback(async () => {
+
     const confirmed = window.confirm(
+
       'Clear all harvested replies and reset your voice profile? This cannot be undone. Your API key and preferences are kept.',
+
     );
+
     if (!confirmed) return;
 
     setClearingVoice(true);
+
     setClearVoiceMessage(null);
+
     setStyleCardError(null);
 
     try {
+
       const card = await clearVoiceData();
+
       setStyleCard(card);
+
       setCorpusCount(0);
+
       setManualReplies('');
+
       setManualImportMessage(null);
+
       setClearVoiceMessage('Voice data cleared. Corpus is empty — paste replies manually to rebuild your voice profile.');
 
       try {
+
         await sendExtensionMessage({ type: 'GET_STYLE_CARD' });
+
       } catch {
+
         /* Background sync is optional */
+
       }
+
     } catch (e) {
+
       setStyleCardError(e instanceof Error ? e.message : 'Could not clear voice data');
+
     } finally {
+
       setClearingVoice(false);
+
     }
+
   }, []);
 
 
 
+
+
+
+
   const refreshRemainingBudget = useCallback(async (budgetMax?: number) => {
+
     try {
+
       const gov = await sendExtensionMessage({ type: 'GET_GOVERNOR_STATUS', targetHandle: '' });
+
       if (gov.ok && gov.governor) {
+
         setRemainingBudget(gov.governor.remainingBudget);
+
         const max = budgetMax ?? dailyBudget;
+
         setRepliesUsedToday(Math.max(0, max - gov.governor.remainingBudget));
+
       }
+
     } catch {
+
       /* governor display is best-effort */
+
     }
+
   }, [dailyBudget]);
 
   const finishOnboarding = useCallback(async () => {
 
-    await saveSettings({
+    await invalidateComposeCache(apiKey);
+
+      await saveSettings({
 
       conditioning,
 
@@ -441,7 +637,9 @@ export default function App() {
     });
 
     // Governor reads budget from storage — refresh after save or Ready shows stale
+
     // remaining from the previous max (e.g. "50 of 100" after raising 50→100).
+
     await refreshRemainingBudget(dailyBudget);
 
     setStep('done');
@@ -449,14 +647,24 @@ export default function App() {
   }, [conditioning, dailyBudget, refreshRemainingBudget]);
 
   const saveDailyBudget = useCallback(async (value: number) => {
+
     const next = Number.isFinite(value) ? Math.min(200, Math.max(5, Math.round(value))) : 50;
+
     setDailyBudget(next);
+
     await saveSettings({ dailyReplyBudget: next });
+
     await refreshRemainingBudget(next);
+
   }, [refreshRemainingBudget]);
 
   const displayedRemaining =
+
     remainingBudget === null ? null : Math.max(0, dailyBudget - repliesUsedToday);
+
+
+
+
 
 
 
@@ -467,6 +675,10 @@ export default function App() {
     await saveSettings({ harvestEnabled: enabled });
 
   }, []);
+
+
+
+
 
 
 
@@ -484,6 +696,10 @@ export default function App() {
 
 
 
+
+
+
+
       <nav className="steps">
 
         {(['key', 'calibrate', 'condition', 'done'] as Step[]).map((s, i) => (
@@ -497,6 +713,10 @@ export default function App() {
         ))}
 
       </nav>
+
+
+
+
 
 
 
@@ -544,6 +764,54 @@ export default function App() {
 
           </div>
 
+          {apiProvider === 'gemini' && (
+
+            <div className="field">
+
+              <label htmlFor="gemini-model">Gemini model</label>
+
+              <select
+
+                id="gemini-model"
+
+                value={geminiModel}
+
+                onChange={(e) => {
+
+                  setGeminiModel(e.target.value);
+
+                  setKeyValid(null);
+
+                  setKeyMessage(null);
+
+                  setKeyWarning(null);
+
+                }}
+
+              >
+
+                {SELECTABLE_GEMINI_MODELS.map((id) => (
+
+                  <option key={id} value={id}>
+
+                    {id}
+
+                  </option>
+
+                ))}
+
+              </select>
+
+              <p className="hint">
+
+                Default is gemini-3.1-flash-lite. Pinning disables fallback to other models. gemini-2.5-flash-lite is no longer offered (unavailable on newer Google AI accounts).
+
+              </p>
+
+            </div>
+
+          )}
+
           <p>{providerMeta.keyHint}</p>
 
           <a href={providerMeta.keyUrl} target="_blank" rel="noreferrer">
@@ -588,6 +856,10 @@ export default function App() {
 
 
 
+
+
+
+
       {step === 'calibrate' && (
 
         <section className="panel">
@@ -601,6 +873,10 @@ export default function App() {
             enable it only if you want replies captured automatically while scrolling your profile.
 
           </p>
+
+
+
+
 
 
 
@@ -622,6 +898,10 @@ export default function App() {
 
 
 
+
+
+
+
           {harvestEnabled && (
 
             <p>
@@ -638,11 +918,19 @@ export default function App() {
 
 
 
+
+
+
+
           <p className="corpus-count" aria-live="polite">
 
             Harvested replies in corpus: <strong>{corpusCount}</strong>
 
           </p>
+
+
+
+
 
 
 
@@ -655,17 +943,28 @@ export default function App() {
             </button>
 
             <button
+
               type="button"
+
               className="danger"
+
               onClick={() => void clearVoice()}
+
               disabled={clearingVoice || corpusCount === 0}
+
             >
+
               {clearingVoice ? 'Clearing…' : 'Clear voice data'}
+
             </button>
 
           </div>
 
           {clearVoiceMessage && <p className="success">{clearVoiceMessage}</p>}
+
+
+
+
 
 
 
@@ -727,6 +1026,10 @@ export default function App() {
 
 
 
+
+
+
+
           <p className="debug-hint">
 
             Debug harvest on x.com: open DevTools console and run{' '}
@@ -734,6 +1037,10 @@ export default function App() {
             <code>localStorage.setItem(&apos;xrc_debug_harvest&apos;, &apos;1&apos;)</code>, then reload and scroll your Replies tab.
 
           </p>
+
+
+
+
 
 
 
@@ -766,6 +1073,10 @@ export default function App() {
         </section>
 
       )}
+
+
+
+
 
 
 
@@ -873,6 +1184,10 @@ export default function App() {
 
 
 
+
+
+
+
       {step === 'done' && (
 
         <section className="panel">
@@ -881,7 +1196,61 @@ export default function App() {
 
           <p>Open X, view a post, click Reply. Suggestions appear when the composer is focused.</p>
 
+          {apiProvider === 'gemini' && (
+
+            <div className="field">
+
+              <label htmlFor="gemini-model-ready">Gemini model</label>
+
+              <select
+
+                id="gemini-model-ready"
+
+                value={geminiModel}
+
+                onChange={(e) => {
+
+                  const next = e.target.value;
+
+                  setGeminiModel(next);
+
+                  void (async () => {
+
+                    clearGeminiModelOrderCache();
+
+                    await saveSettings({ geminiModel: next });
+
+                    await invalidateComposeCache(apiKey);
+
+                  })();
+
+                }}
+
+              >
+
+                {SELECTABLE_GEMINI_MODELS.map((id) => (
+
+                  <option key={id} value={id}>
+
+                    {id}
+
+                  </option>
+
+                ))}
+
+              </select>
+
+            </div>
+
+          )}
+
           <p className="subtitle">Provider: {PROVIDER_META[apiProvider].label}</p>
+
+          {apiProvider === 'gemini' && (
+
+            <p className="subtitle">Model: {geminiModel}</p>
+
+          )}
 
           <ul>
 
@@ -893,7 +1262,157 @@ export default function App() {
 
           </ul>
 
-          <div className="disclosure">
+          
+
+        <section className="panel">
+
+          <h2>Usage &amp; spending</h2>
+
+          <p>
+
+            Estimated from Gemini input/output/thinking tokens at Standard paid rates.
+
+            Cache storage ($/hour) is not included. Stamp: {PRICING_STAMP}. 3.5-flash-lite rates are user-verified.
+
+          </p>
+
+          <p className="corpus-count" aria-live="polite">
+
+            Lifetime estimate: <strong>{usage ? formatUsd(usage.totalUsd) : '—'}</strong>
+
+            {' '}· {usage?.totalCalls ?? 0} calls · {(usage?.totalInputTokens ?? 0).toLocaleString()} in /{' '}
+
+            {(usage?.totalOutputTokens ?? 0).toLocaleString()} out
+
+            {(usage?.totalThinkingTokens ?? 0) > 0
+
+              ? ` / ${usage!.totalThinkingTokens.toLocaleString()} thinking`
+
+              : ''}
+
+          </p>
+
+          {usage && Object.keys(usage.byModel).length > 0 ? (
+
+            <table className="usage-table">
+
+              <thead>
+
+                <tr>
+
+                  <th>Model</th>
+
+                  <th>Calls</th>
+
+                  <th>Input</th>
+
+                  <th>Output</th>
+
+                  <th>Thinking</th>
+
+                  <th>Est. USD</th>
+
+                </tr>
+
+              </thead>
+
+              <tbody>
+
+                {Object.entries(usage.byModel).map(([model, row]) => (
+
+                  <tr key={model}>
+
+                    <td>{model}</td>
+
+                    <td>{row.calls}</td>
+
+                    <td>{row.inputTokens.toLocaleString()}</td>
+
+                    <td>{row.outputTokens.toLocaleString()}</td>
+
+                    <td>{row.thinkingTokens.toLocaleString()}</td>
+
+                    <td>{formatUsd(row.estimatedUsd)}</td>
+
+                  </tr>
+
+                ))}
+
+              </tbody>
+
+            </table>
+
+          ) : (
+
+            <p>No billed generations recorded yet. Use the extension on X, then reopen Options.</p>
+
+          )}
+
+          <div className="corpus-actions">
+
+            <button
+
+              onClick={() => {
+
+                void (async () => {
+
+                  setResettingUsage(true);
+
+                  try {
+
+                    setUsage(await resetUsage());
+
+                  } finally {
+
+                    setResettingUsage(false);
+
+                  }
+
+                })();
+
+              }}
+
+              disabled={resettingUsage || !usage || usage.totalCalls === 0}
+
+            >
+
+              {resettingUsage ? 'Resetting…' : 'Reset usage'}
+
+            </button>
+
+            <button
+
+              onClick={() => {
+
+                void (async () => {
+
+                  try {
+
+                    setUsage(await getUsageSummary());
+
+                  } catch {
+
+                    /* ignore */
+
+                  }
+
+                })();
+
+              }}
+
+            >
+
+              Refresh
+
+            </button>
+
+          </div>
+
+        </section>
+
+
+
+<div className="disclosure">
 
             <strong>Data disclosure:</strong> This extension reads posts you view on X (via passive GraphQL interception)
 
@@ -906,6 +1425,10 @@ export default function App() {
             Harvested replies in corpus: <strong>{corpusCount}</strong>
 
           </p>
+
+
+
+
 
 
 
@@ -943,6 +1466,10 @@ export default function App() {
 
 
 
+
+
+
+
           <label className="checkbox-row">
 
             <input
@@ -961,6 +1488,10 @@ export default function App() {
 
 
 
+
+
+
+
           {styleCard && (
 
             <div className="style-card">
@@ -972,6 +1503,10 @@ export default function App() {
             </div>
 
           )}
+
+
+
+
 
 
 
@@ -1003,20 +1538,35 @@ export default function App() {
 
 
 
+
+
+
+
           <div className="corpus-actions">
 
             <button
+
               type="button"
+
               className="danger"
+
               onClick={() => void clearVoice()}
+
               disabled={clearingVoice || corpusCount === 0}
+
             >
+
               {clearingVoice ? 'Clearing…' : 'Clear voice data'}
+
             </button>
 
           </div>
 
           {clearVoiceMessage && <p className="success">{clearVoiceMessage}</p>}
+
+
+
+
 
 
 
@@ -1033,4 +1583,5 @@ export default function App() {
   );
 
 }
+
 

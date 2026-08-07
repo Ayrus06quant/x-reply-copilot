@@ -597,13 +597,16 @@ distinguishes "no output" from "the model spent its whole budget thinking" and s
 
 ### 7.2 Model discovery and fallback
 
-The plan pinned `gemini-2.5-flash-lite`. The user's key did not expose it via ListModels, so discovery
-was added. `discoverModels` (line 767) calls ListModels, keeps anything matching `/flash/i` that
-supports `generateContent` or `interact`, and sorts by the preference list
-`['gemini-2.5-flash-lite','gemini-2.5-flash','gemini-2.0-flash-lite','gemini-2.0-flash']`
-(lines 18-23). `resolveModelOrder` (line 800) layers a stored preference on top and falls back to the
-persisted discovery list, then to the constant. `callGemini` (line 860) then tries each model in turn,
-short-circuiting only on 401/403/429.
+The plan pinned `gemini-2.5-flash-lite`. Discovery via ListModels remains for keys that expose a
+subset of flash models. Preference order is now
+`['gemini-2.5-flash-lite','gemini-3.1-flash-lite','gemini-3.5-flash-lite','gemini-2.5-flash', …]`.
+Options persists `UserSettings.geminiModel` (default `gemini-2.5-flash-lite`). When that pin is set,
+`resolveModelOrder` returns **only** the pinned model — no silent cascade to Flash (required for
+honest A/B latency tests). `preferredGeminiModel` is kept in sync on success.
+
+Compose may attach an explicit `createCachedContent` resource for the stable prompt prefix
+(`lib/gemini-cache.ts` + `buildComposeCachePrefix`); dynamic fenced post content stays out of the
+cache (I7). Under-min-token creates are skipped with a log; compose falls back to the full prompt.
 
 ### 7.3 Thinking-token control
 
@@ -617,18 +620,20 @@ parse error."*
 
 The remedy, all in `lib/gemini.ts`:
 
-- `interactionsThinkingConfig()` (line 449) sends `thinking_level: 'minimal'`, `thinking_summaries: 'none'`.
-- `generateContentThinkingConfig(model)` (line 453) sends `thinkingConfig.thinkingBudget: 0`, but only
-  for `gemini-2.5`, with a correct comment that 3.x models cannot disable it.
+- `interactionsThinkingConfig()` sends `thinking_level: 'minimal'`, `thinking_summaries: 'none'`.
+- `generateContentThinkingConfig(model)` sends `thinkingConfig.thinkingBudget: 0` for `gemini-2.5*`,
+  and `thinkingConfig.thinkingLevel: 'minimal'` for `gemini-3*` (3.x cannot fully disable thinking).
 - `isConfigRejection` detects a 400 caused by the thinking fields and retries once without them.
   Wave 2 / item 9 capped that path: `inflatedTokenBudget` = `min(maxTokens + 512, 5120)` so compose
-  falls back at **4608**, logged on both routes (`gemini.ts:488-493`, `:598-602`, `:714-718`). The
-  old 16384 ceiling is gone. Happy-path thinking control is unchanged.
+  falls back at **4608**. The old 16384 ceiling is gone. Happy-path 2.5 `thinkingBudget: 0` is
+  unchanged (§4 R4).
 - Budgets: compose **4096**, comprehend **2048**, vision **512**, key-validation probe **256**.
   Wall-clock abandon further model fallbacks after **8 s** (`COMPOSE_WALL_CLOCK_MS`); ListModels list
   persisted with `discoveredGeminiModelsAt` + 24 h TTL.
 - Truncation is detected explicitly — `status === 'incomplete' || 'budget_exceeded'` on Interactions,
   `finishReason === 'MAX_TOKENS'` on `generateContent` — and surfaced in the error text.
+- Token usage is aggregated in `lib/usage.ts` (`xrcUsageLedger`) for the Options dashboard and card
+  spend chip; rates stamped `2026-08-07` (3.5-flash-lite user-verified).
 
 This is worth flagging against the plan, which anticipated the class of problem: "Gemini 3.x Flash
 models emit reasoning tokens before the first visible token, pushing TTFT to 6-8s at defaults. Pin the
@@ -1086,10 +1091,14 @@ failure logging.
 
 ### F11 — Medium: insert success is verified by text comparison, not by the Post button state
 
-> **RESOLVED IN CODE 2026-08-06** (Wave 3 / backlog item 15). **Implemented, awaiting live
-> verification.** `insertLooksSuccessful` requires `composerMatches(text) && isPostButtonEnabled()`
-> (`composer.ts:95-97`) and is used by insert paths. Outstanding observable: insert enables Post on a
-> real Lexical composer.
+> **RESOLVED IN CODE 2026-08-06** (Wave 3 / backlog item 15). **Live proof 2026-08-08 (session
+> d72744):** the reply composer on this account is **Draft.js** (`public-DraftEditor-content`), not
+> Lexical. `execCommand('insertText')` wrote DOM text Draft did not own → Backspace
+> `defaultPrevented` with `textChanged:false`, and stacked methods doubled text. Fix: Draft path is
+> paste / beforeinput only (never execCommand); replace requires a covering select-all (text-node
+> ranges); paste is skipped when selection would append. Verified: `method:paste`, `doubled:false`
+> on successive clicks, Backspace `textChanged:true`. Lexical path remains paste-only;
+> `insertLooksSuccessful` still requires Post `aria-disabled` cleared.
 
 Historical defect: text-equality only; `isPostButtonEnabled` had zero call sites.
 
@@ -1150,16 +1159,18 @@ behind the worker now that `lib/messaging.ts` has a working wake-and-retry.
 
 ### F17 — Medium: worst-case provider latency is unbounded relative to the 700–1200ms design target
 
-> **PARTIALLY ADDRESSED 2026-08-06** — instrumentation (item 1) and budgets/caps (Wave 2 / item 9)
-> landed in code. The finding stays open until ten warm/cold trials are recorded.
+> **PARTIALLY ADDRESSED 2026-08-06; EXTENDED 2026-08-07** — instrumentation (item 1) and budgets/caps
+> (Wave 2 / item 9) landed; 2026-08-07 added Options model pin (default now `gemini-3.1-flash-lite`
+> after `gemini-2.5-flash-lite` was retired for newer accounts), no silent Flash cascade, 3.x
+> `thinkingLevel: minimal`, compose-prefix `createCachedContent`, and a token/$ usage ledger.
 > `lib/perf.ts` → `chrome.storage.local.xrcLastPipelineTiming`. Item 9: config-rejection ceiling
 > **5120** (compose fallback **4608**, logged); `discoveredGeminiModelsAt` + 24 h TTL;
 > COMPOSE/COMPREHEND messaging timeout **12 s** with immediate break on non-transient errors;
 > abandon further model fallbacks after **8 s** wall-clock; StyleCard/gate load overlap with
-> compose; `persistGeminiPrefs` write-on-change only. Happy-path thinking left alone.
-> Warm 700–1200 ms assessed as plausible but **not measured** with a live key. Cold still likely
-> 2–4 s. Per-attempt `FETCH_TIMEOUT_MS = 25_000` remains — an in-flight HTTP call is not aborted
-> when the wall clock expires.
+> compose; `persistGeminiPrefs` write-on-change only. Happy-path 2.5 thinkingBudget:0 left alone.
+> Warm 700–1200 ms assessed as plausible but **not measured** with a live key. Cold sub-5s on
+> pinned lite is a **hypothesis** until measured. Per-attempt `FETCH_TIMEOUT_MS = 25_000` remains —
+> an in-flight HTTP call is not aborted when the wall clock expires.
 
 On a prefetch miss, `handleCompose` still awaits Stage 1 before Stage 2 (design: warm path is the
 target). The plan's premise was that "Generation that starts on post-open finishes before you ask,"

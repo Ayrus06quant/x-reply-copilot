@@ -13,7 +13,8 @@ export interface ApiKeyValidation {
 export async function validateApiKeyForProvider(
   provider: Provider,
   apiKey: string,
+  geminiModel?: string,
 ): Promise<ApiKeyValidation> {
   if (provider === 'groq') return validateGroqKey(apiKey);
-  return validateGeminiKey(apiKey);
+  return validateGeminiKey(apiKey, geminiModel);
 }

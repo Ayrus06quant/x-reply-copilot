@@ -2,8 +2,14 @@ import type { UserSettings } from './types';
 
 const STORAGE_KEY = 'x_reply_copilot_settings';
 
+/** Default when unset or when a retired model was previously pinned. */
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.1-flash-lite';
+
+const RETIRED_GEMINI_MODELS = new Set(['gemini-2.5-flash-lite']);
+
 const DEFAULT_SETTINGS: UserSettings = {
   apiProvider: 'gemini',
+  geminiModel: DEFAULT_GEMINI_MODEL,
   conditioning: {},
   onboardingComplete: false,
   dailyReplyBudget: 50,
@@ -11,10 +17,32 @@ const DEFAULT_SETTINGS: UserSettings = {
   harvestEnabled: false,
 };
 
+function normalizeGeminiModel(model: string | undefined): string {
+  if (!model || RETIRED_GEMINI_MODELS.has(model)) return DEFAULT_GEMINI_MODEL;
+  return model;
+}
+
 export async function getSettings(): Promise<UserSettings> {
   const result = await chrome.storage.local.get(STORAGE_KEY);
   const stored = result[STORAGE_KEY] as UserSettings | undefined;
-  return { ...DEFAULT_SETTINGS, ...stored, conditioning: { ...DEFAULT_SETTINGS.conditioning, ...stored?.conditioning } };
+  const merged: UserSettings = {
+    ...DEFAULT_SETTINGS,
+    ...stored,
+    conditioning: { ...DEFAULT_SETTINGS.conditioning, ...stored?.conditioning },
+  };
+  const normalized = normalizeGeminiModel(merged.geminiModel);
+  if (merged.geminiModel !== normalized) {
+    merged.geminiModel = normalized;
+    await chrome.storage.local.set({ [STORAGE_KEY]: merged });
+  }
+  const prefs = await chrome.storage.local.get(['preferredGeminiModel']);
+  if (
+    typeof prefs.preferredGeminiModel === 'string' &&
+    RETIRED_GEMINI_MODELS.has(prefs.preferredGeminiModel)
+  ) {
+    await chrome.storage.local.set({ preferredGeminiModel: normalized });
+  }
+  return merged;
 }
 
 export async function saveSettings(partial: Partial<UserSettings>): Promise<void> {

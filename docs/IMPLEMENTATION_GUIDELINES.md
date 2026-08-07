@@ -775,28 +775,38 @@ trackers.
 
 ### 9. Bring latency inside the budget — M
 
-- **Status:** Implemented, awaiting live verification (Wave 2). Budgets and caps landed in code; warm
-  700–1200 ms assessed as plausible but **not measured** with a live key — use
-  `xrcLastPipelineTiming`. Cold still likely 2–4 s. `[F17]` stays open until trials are recorded.
+- **Status:** Extended 2026-08-07 (model pin + 3.x minimal thinking + compose-prefix
+  `createCachedContent` + usage ledger). Prior Wave 2 caps remain. Live warm/cold trials still
+  **outstanding** — `[F17]` open until recorded. Sub-5s cold is a **hypothesis** until
+  `xrcLastPipelineTiming` shows it.
 - **Grounded in:** `[plan §1]` (the 700-1200 ms window), `[F17]`, `[user]` *"generation took 6-7
-  seconds"*.
+  seconds"*; `[user]` model switch / min thinking / `createCachedContent` / cost dashboard.
 - **Was broken:** unbounded config-rejection fallback (16384), cold ListModels every wake, messaging
-  retry fan-out to minutes, no wall-clock abandon across model fallbacks (see §5.3 historical rows).
+  retry fan-out to minutes, no wall-clock abandon across model fallbacks (see §5.3 historical rows);
+  silent cascade to `gemini-2.5-flash` when lite was unavailable; 3.x thinking uncontrolled on
+  generateContent.
 - **Landed `[verified 2026-08-06]`:**
   - Config-rejection ceiling **5120** (compose fallback **4608** = 4096+512), logged on both routes
-    (`gemini.ts:488-493`, `:598-602`, `:714-718`);
-  - ListModels persistence with `discoveredGeminiModelsAt` + 24 h TTL (`:272-294`, `:838-858`);
-  - Messaging: COMPOSE/COMPREHEND timeout **12 s**; non-transient errors break immediately
-    (`messaging.ts:8-9`, `:125-165`);
-  - Wall-clock abandon further model fallbacks after **8 s** (`COMPOSE_WALL_CLOCK_MS`,
-    `gemini.ts:164-165`, `:910-926`) — in-flight HTTP not aborted; `FETCH_TIMEOUT_MS` remains 25 s;
-  - StyleCard + gate load start before compose; gate await deferred after generation
-    (`background.ts:313-355`);
-  - `persistGeminiPrefs` writes only on change (`gemini.ts:265-268`);
-  - Happy-path thinking config left alone (§4 R4).
+    (`gemini.ts`);
+  - ListModels persistence with `discoveredGeminiModelsAt` + 24 h TTL;
+  - Messaging: COMPOSE/COMPREHEND timeout **12 s**; non-transient errors break immediately;
+  - Wall-clock abandon further model fallbacks after **8 s** (`COMPOSE_WALL_CLOCK_MS`);
+  - StyleCard + gate load start before compose; gate await deferred after generation;
+  - `persistGeminiPrefs` writes only on change;
+  - Happy-path 2.5 thinkingBudget:0 preserved (§4 R4).
+- **Landed `[verified 2026-08-07]` (code):**
+  - `UserSettings.geminiModel` default `gemini-2.5-flash-lite`; Options picker; pin-only
+    `resolveModelOrder` (no silent Flash cascade);
+  - Preference list includes `3.1-flash-lite` / `3.5-flash-lite`;
+  - 3.x `thinkingConfig.thinkingLevel: 'minimal'` on generateContent; Interactions still
+    `thinking_level: minimal`;
+  - Compose prefix/suffix split + `lib/gemini-cache.ts` `createCachedContent` (graceful skip under
+    min tokens);
+  - `lib/usage.ts` lifetime ledger + Options dashboard + card spend chip.
 - **Observable (outstanding):** item-1 timing log shows warm compose under 1200 ms and cold under
-  4000 ms across ten trials, recorded in `docs/VERIFY.md`.
-- **Depends on:** 1, 4. **Do not** touch the thinking config as part of measurement — §4 R4.
+  5000 ms (user target) / 4000 ms (§5.4) across ten trials, recorded in `docs/VERIFY.md`. Cache hit
+  shows `cachedContentTokenCount` or an explicit under-min skip log.
+- **Depends on:** 1, 4. **Do not** loosen 2.5 happy-path thinkingBudget:0 — §4 R4.
 
 ### 10. Make `chrome.storage.session` reachable — XS, no dependencies
 

@@ -77,15 +77,50 @@ export interface Conditioning {
 
 export type Provider = 'gemini' | 'groq';
 
+/** Models offered in Options. 2.5-flash-lite removed — unavailable on newer Google AI accounts. */
+export const SELECTABLE_GEMINI_MODELS = [
+  'gemini-3.1-flash-lite',
+  'gemini-3.5-flash-lite',
+  'gemini-2.5-flash',
+] as const;
+
+export type SelectableGeminiModel = (typeof SELECTABLE_GEMINI_MODELS)[number];
+
 export interface UserSettings {
   apiKey?: string;
   apiProvider?: Provider;
+  /**
+   * Pinned Gemini model for A/B latency tests. When set, the SW does not cascade to
+   * other models on failure (except a clear user-visible error).
+   */
+  geminiModel?: SelectableGeminiModel | string;
   conditioning: Conditioning;
   onboardingComplete: boolean;
   dailyReplyBudget: number;
   accountNudgeThreshold: number;
   /** When false (default), passive GraphQL reply harvesting is skipped. Manual paste still works. */
   harvestEnabled?: boolean;
+}
+
+/** Lifetime spend summary surfaced on the card and Options (numbers only — never the key). */
+export interface UsageSummary {
+  totalUsd: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalThinkingTokens: number;
+  totalCalls: number;
+  byModel: Record<
+    string,
+    {
+      calls: number;
+      inputTokens: number;
+      outputTokens: number;
+      thinkingTokens: number;
+      cachedInputTokens: number;
+      estimatedUsd: number;
+    }
+  >;
+  pricingStamp: string;
 }
 
 export interface ComprehendResult {
@@ -199,7 +234,7 @@ export type ExtensionMessage =
   | { type: 'COMPREHEND'; postBrief: PostBrief }
   | { type: 'COMPOSE'; postBrief: PostBrief; refinement?: RefinementChip }
   | { type: 'GET_SUGGESTIONS'; tweetId: string }
-  | { type: 'VALIDATE_API_KEY'; apiKey: string; provider?: Provider }
+  | { type: 'VALIDATE_API_KEY'; apiKey: string; provider?: Provider; geminiModel?: string }
   /** A whole intercepted batch in one message — one round trip per response, not per reply. */
   | { type: 'HARVEST_REPLY'; replies: Array<{ text: string; handle: string }> }
   | { type: 'IMPORT_MANUAL_REPLIES'; text: string; handle: string }
@@ -208,6 +243,8 @@ export type ExtensionMessage =
   | { type: 'GET_STYLE_CARD' }
   | { type: 'GET_GOVERNOR_STATUS'; targetHandle: string }
   | { type: 'GET_LAST_STYLE_REGEN' }
+  | { type: 'GET_USAGE_SUMMARY' }
+  | { type: 'RESET_USAGE' }
   | { type: 'PING' };
 
 export type ExtensionResponse =
@@ -227,6 +264,8 @@ export type ExtensionResponse =
       timing?: PipelineTiming;
       /** Visible before/after when the flywheel regenerates the StyleCard (~50 posts). */
       styleRegen?: StyleCardRegenSnapshot;
+      /** Lifetime Gemini token/$ totals for the card and Options dashboard. */
+      usageSummary?: UsageSummary;
     }
   | { ok: false; error: string };
 

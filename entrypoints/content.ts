@@ -530,6 +530,7 @@ async function prefetchCompose(brief: PostBrief): Promise<void> {
           setRefinementsEnabled(true);
           setLoading(false);
           if (res.governor) updateBudgetDisplay(res.governor.remainingBudget);
+          if (res.usageSummary) updateSpendDisplay(res.usageSummary.totalUsd);
           logTiming('card rendered', {
             tweetId: brief.tweetId,
             source: brief.source ?? 'dom',
@@ -634,6 +635,7 @@ async function composeSuggestions(refinement?: RefinementChip): Promise<void> {
         worker: res.timing,
       });
       if (res.governor) updateBudgetDisplay(res.governor.remainingBudget);
+      if (res.usageSummary) updateSpendDisplay(res.usageSummary.totalUsd);
       const nudges: string[] = [];
       if (res.governor?.nudge) nudges.push(res.governor.nudge);
       // F10: degraded Stage 1 must be visible, not silently reused.
@@ -681,6 +683,7 @@ function createCard(): void {
     <div class="xrc-header">
       <span class="xrc-reading" aria-live="polite">Reading this post</span>
       <span class="xrc-budget" aria-live="polite" title="Daily reply budget remaining"></span>
+      <span class="xrc-spend" aria-live="polite" title="Estimated lifetime Gemini spend"></span>
       <button class="xrc-close" aria-label="Dismiss">×</button>
     </div>
     <div class="xrc-disclosure">This extension reads posts you view on X to suggest replies. Data goes directly to Gemini with your API key.</div>
@@ -735,6 +738,7 @@ function getInlineStyles(): string {
     .xrc-budget { font-size: 11px; color: #71767b; margin-left: auto; white-space: nowrap; }
     .xrc-budget.xrc-budget-low { color: #ffad1f; }
     .xrc-budget.xrc-budget-blocked { color: #f4212e; }
+    .xrc-spend { font-size: 11px; color: #71767b; white-space: nowrap; }
     .xrc-close { background: none; border: none; color: #71767b; font-size: 20px; cursor: pointer; }
     .xrc-disclosure { font-size: 11px; color: #71767b; margin-bottom: 10px; line-height: 1.4; }
     .xrc-suggestion { padding: 10px 12px; margin-bottom: 8px; background: #192734; border-radius: 12px;
@@ -879,6 +883,23 @@ function updateBudgetDisplay(remaining: number): void {
   el.classList.toggle('xrc-budget-blocked', remaining <= 0);
 }
 
+/** Lifetime estimated Gemini spend — numbers only, never the API key (I4). */
+function updateSpendDisplay(totalUsd: number): void {
+  const el = shadowRoot?.querySelector('.xrc-spend') as HTMLElement | null;
+  if (!el) return;
+  if (!Number.isFinite(totalUsd) || totalUsd <= 0) {
+    el.textContent = '';
+    return;
+  }
+  const text =
+    totalUsd < 0.001
+      ? `~$${totalUsd.toFixed(5)}`
+      : totalUsd < 0.01
+        ? `~$${totalUsd.toFixed(4)}`
+        : `~$${totalUsd.toFixed(3)}`;
+  el.textContent = `${text} spent`;
+}
+
 async function refreshGovernorStatus(): Promise<void> {
   const handle = currentPost?.authorHandle;
   if (!handle) return;
@@ -958,11 +979,12 @@ async function selectSuggestion(index: number, insert: boolean): Promise<void> {
     isInserting = true;
     try {
       focusComposer();
-      const result = insertIntoComposer(s.text);
+      const result = await insertIntoComposer(s.text);
 
       if (result.success) {
         flashSuggestionItem(index);
         showActionToast('Inserted');
+        // Clipboard is a manual-paste fallback only — do not re-insert.
         void copyToClipboard(s.text);
         return;
       }

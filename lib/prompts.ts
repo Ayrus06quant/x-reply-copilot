@@ -160,7 +160,7 @@ ${fenceUntrusted('top_replies', repliesBlock)}`;
 }
 
 /** Valid-JSON output contract. A template with `|` unions or `...` invites unparseable echoes. */
-const COMPOSE_OUTPUT_CONTRACT = `Generate exactly ${COMPOSE_CANDIDATE_COUNT} candidate replies using verbalized sampling.
+export const COMPOSE_OUTPUT_CONTRACT = `Generate exactly ${COMPOSE_CANDIDATE_COUNT} candidate replies using verbalized sampling.
 
 Respond with a single JSON object and nothing else — no markdown fences, no commentary before or after:
 {
@@ -195,14 +195,18 @@ function composeMediaBlock(req: ComposeRequest): string {
   return '';
 }
 
-export function buildComposePrompt(req: ComposeRequest): string {
-  const { comprehend, styleCard, exemplars, conditioning, refinement, username } = req;
+/**
+ * Stable compose prefix — voice framing, style facts, conditioning, output contract.
+ * Safe to put in createCachedContent (no fenced untrusted post content — I7).
+ * Refinement instruction is included when present so length chips stay consistent with cache.
+ */
+export function buildComposeCachePrefix(req: ComposeRequest): string {
+  const { styleCard, conditioning, refinement, username } = req;
   const effect = resolveRefinementEffect(styleCard, refinement);
   const lengthCard = styleCardForRefinement(styleCard, effect);
 
   const sections: string[] = [
     `Complete what @${username} would post as a reply. Write in third person about @${username}'s voice — do NOT address the reader as "you".`,
-    // Chip direction first so it outvotes the measured length band that used to win.
     effect.instruction,
     `Style facts (measured, not aspirational):
 - Target ~${lengthCard.medianWordCount} words (${lengthCard.wordCountP25}-${lengthCard.wordCountP75} range)
@@ -214,15 +218,24 @@ export function buildComposePrompt(req: ComposeRequest): string {
 - NEVER use: ${BANNED_WORDS.join(', ')}
 - No URLs, no hashtags, no @handles not in the thread`,
     conditioningBlock(conditioning),
-    // This list is derived from other users' reply text, so it is untrusted input and is
-    // fenced like every other outside-origin field (I7 / F9). It used to be interpolated
-    // straight into the instruction channel.
+    COMPOSE_OUTPUT_CONTRACT,
+  ];
+
+  return sections.map((s) => s.trim()).filter(Boolean).join('\n\n');
+}
+
+/**
+ * Per-request compose suffix — fenced post context, exemplars, replies-already-said.
+ * Never put this in createCachedContent (I7).
+ */
+export function buildComposeDynamicSuffix(req: ComposeRequest): string {
+  const { comprehend, exemplars, username } = req;
+  const sections: string[] = [
     `Avoid repeating what top replies already said:
 ${fenceUntrusted(
   'replies_already_said',
   comprehend.repliesAlreadySaid.map((r) => `- ${r}`).join('\n') || '- (none listed)',
 )}`,
-    // Corpus is empty by default — omit the section entirely rather than emit an empty list.
     exemplars.length > 0
       ? `Exemplars of @${username}'s reply style (match length and register, NOT topic):\n${exemplars
           .map((e, i) => `${i + 1}. ${e}`)
@@ -232,10 +245,16 @@ ${fenceUntrusted(
     fenceUntrusted('post_tone', comprehend.tone),
     fenceUntrusted('post_text', req.postBrief.text),
     composeMediaBlock(req),
-    COMPOSE_OUTPUT_CONTRACT,
   ];
 
   return sections.map((s) => s.trim()).filter(Boolean).join('\n\n');
+}
+
+export function buildComposePrompt(req: ComposeRequest): string {
+  return [buildComposeCachePrefix(req), buildComposeDynamicSuffix(req)]
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 function conditioningBlock(c: Conditioning): string {
