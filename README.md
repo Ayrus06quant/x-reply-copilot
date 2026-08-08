@@ -9,7 +9,7 @@ A human-in-the-loop reply co-pilot for X (Twitter). Passively reads X's own Grap
 - **Prefetch** — Comprehend on post-open, Compose on reply click (implemented; awaiting live verification)
 - **Voice matching** — StyleCard from your harvested replies, 5 exemplars, completion-style prompting
 - **Shadow DOM UI** — Suggestion card appears only when composer opens; zero web_accessible_resources
-- **Rate governor** — Daily reply budget, per-account nudges, shape variance check (wired on CreateTweet; awaiting live verification — backlog item 11)
+- **Rate governor** — Daily reply budget and shape variance check (wired on CreateTweet; awaiting live verification — backlog item 11). Per-handle "vary your targets" nudges removed by design.
 - **Flywheel** — Tracks suggestion vs posted diff, feeds posted text into the corpus, regenerates StyleCard every ~50 replies with Options before/after (implemented; awaiting live verification — backlog item 12)
 
 ## Install (Load Unpacked)

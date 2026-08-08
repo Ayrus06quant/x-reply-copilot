@@ -92,7 +92,7 @@ convention. The "Context" column is where the code actually executes at runtime.
 | `lib/provider.ts` | 20 | service worker | `AiProviderModule` interface and the `gemini`/`groq` registry. |
 | `lib/api-validation.ts` | 20 | service worker + options page | Provider-agnostic key validation entry point. |
 | `lib/flywheel.ts` | 119 | service worker | `posted_diffs` store, diff recording, 50-reply StyleCard regeneration trigger, Levenshtein helper. |
-| `lib/governor.ts` | 81 | service worker | Daily budget and per-account counters in `chrome.storage.local`, nudge text, shape-variance check. |
+| `lib/governor.ts` | — | service worker | Daily budget and per-account counters in `chrome.storage.local`; hard-budget nudge + shape-variance (per-handle target-variety nudge removed). |
 | `lib/messaging.ts` | 167 | content script + options page | Service-worker wake and retry wrapper with human-readable MV3 error translation. |
 | `lib/debug.ts` | 99 | all | Opt-in harvest/media debug logging plus the always-on generation-failure recorder written to `chrome.storage.local`. |
 | `lib/perf.ts` | 80 | all | **Added 2026-08-06.** Always-on `logEntry` proof-of-execution line per entrypoint, `performance.now()` helpers, and the `PipelineTiming` record persisted to `chrome.storage.local.xrcLastPipelineTiming`. |
@@ -252,10 +252,12 @@ The worker runs `handleCompose`: governor check (incl. shape variance over recen
 (cached or freshly awaited inline; degraded results are not session-cached), StyleCard, exemplars,
 provider compose call, parse, rerank, gate, cache, return. Remaining budget is shown on the card.
 
-Three suggestions render. You click one or press `Ctrl+1`. `insertIntoComposer` clears the composer,
-tries synthetic paste, and treats success as text match **and** Post `aria-disabled` cleared (F11 —
-live Lexical proof outstanding). The text is also copied to the clipboard. You edit and post it
-yourself. CreateTweet (when observed) increments the governor and records a flywheel diff.
+Three suggestions render. A single click or `Ctrl+1` selects; a second activation (same shortcut or
+double-click) runs `insertIntoComposer`, then collapses the card to a small **Suggestions** chip
+(click to restore). Insert clears the composer, tries synthetic paste, and treats success as text
+match **and** Post `aria-disabled` cleared (F11 — live Lexical proof outstanding). The text is also
+copied to the clipboard. You edit and post it yourself. CreateTweet (when observed) increments the
+governor and records a flywheel diff.
 
 ---
 
@@ -489,10 +491,11 @@ subsequent `focusin`.
 
 `renderSuggestions` (`content.ts:518-533`) writes one row per suggestion, escaping `&`, `<`, `>`.
 
-### (c) Suggestion click / `Ctrl+1/2/3` → composer insertion
+### (c) Suggestion select → second activation → composer insertion
 
-`selectSuggestion` (`content.ts:546-581`) guards re-entry with `isInserting`, records the served
-suggestion, focuses the composer, and calls `insertIntoComposer` (`composer.ts:155-187`), which:
+`activateSuggestion` in `content.ts` selects on first click/shortcut; second activation (same
+shortcut or double-click) guards re-entry with `isInserting`, records the served suggestion, focuses
+the composer, calls `insertIntoComposer` (`composer.ts`), and collapses to the Suggestions chip:
 
 - finds `[data-testid="tweetTextarea_0"]`,
 - clears it with `selectAll` + `delete` so the insert replaces rather than appends,
@@ -502,11 +505,10 @@ suggestion, focuses the composer, and calls `insertIntoComposer` (`composer.ts:1
   the `composerHasContent()` early return at `composer.ts:169-171`,
 - otherwise clears and tries `beforeinput`/`input` with `inputType: 'insertText'`, then `execCommand('insertText')`.
 
-On success the card row flashes green, an "Inserted" toast appears, and the text is also written to the
-clipboard. On failure the user is told to paste manually with the platform-correct shortcut
-(`content.ts:566-572`). What is missing is the plan's verification step: the Post button's
-`aria-disabled` is never checked. `isPostButtonEnabled()` exists at `composer.ts:15` and has zero call
-sites. See **F11**.
+On success an "Inserted" toast appears, the full card collapses to the Suggestions chip, and the text
+is also written to the clipboard. On failure the user is told to paste manually with the
+platform-correct shortcut. Post-button `aria-disabled` verification is via `insertLooksSuccessful`
+(F11 — live Lexical proof outstanding).
 
 ### (d) Refinement chips
 

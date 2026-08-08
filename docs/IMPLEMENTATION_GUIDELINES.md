@@ -822,7 +822,7 @@ trackers.
 
 ### 11. Make the governor actually count — S
 
-- **Status:** Implemented, awaiting live verification (Wave 3).
+- **Status:** Implemented, awaiting live verification (Wave 3). Per-handle soft nudge removed `[user]` 2026-08-08.
 - **Grounded in:** `[F2]`, `[plan todo:governor]` *"Rate governor with a hard visible budget,
   shape-variance enforcement, and per-target-account nudges"*, and `[plan §5]`: *"There is a documented
   case of a fully manual human workflow getting shadowbanned on volume and repetition alone."*
@@ -832,8 +832,10 @@ trackers.
   `recordReplyToAccount(sanitizeAuthorHandle(...))` (`background.ts:308-324`); `enrichGovernorStatus`
   wires `checkShapeVariance` over recent `posted_diffs` (`:192-201`); card + Options send
   `GET_GOVERNOR_STATUS` and render remaining budget (`content.ts:750-756`, `App.tsx:164-166`, `:877-881`).
+- **UX override `[user]` 2026-08-08:** the per-target-account soft nudge ("Consider varying your targets")
+  is no longer shown; hard daily budget + shape-variance remain. Counters still recorded.
 - **Observable (outstanding — live x.com):** CreateTweet → governor increments; card budget updates after
-  posts.
+  posts. Per-handle variety warning must not appear.
 - **Depends on:** 2 if counting on `CreateTweet` (taken).
 
 ### 12. Make the flywheel learn — M

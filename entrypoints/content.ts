@@ -28,9 +28,23 @@ const OWN_USER_ID_MAX_SCANS = 5;
 const IDENTITY_DEBOUNCE_MS = 250;
 export const GRAPHQL_HEALTH_KEY = 'xrcGraphqlHealth';
 
+/** Rotating status while Stage 2 runs — tasteful, no emoji spam. */
+const THINKING_PHRASES = [
+  'Thinking…',
+  'Combobulating…',
+  'Reading the room…',
+  'Finding the angle…',
+  'Drafting in your voice…',
+  'Weighing the replies…',
+  'Tuning the tone…',
+] as const;
+const THINKING_ROTATE_MS = 1600;
+
 let currentPost: PostBrief | null = null;
 let suggestions: Suggestion[] = [];
 let cardVisible = false;
+/** Collapsed chip after insert — restores the full card on click. */
+let chipVisible = false;
 let isReading = false;
 let composeReady = false;
 let isGenerating = false;
@@ -44,6 +58,10 @@ let ownUserIdScans = 0;
 let lastRefinement: RefinementChip | undefined;
 let feedbackTimeout: ReturnType<typeof setTimeout> | null = null;
 let isInserting = false;
+/** Highlighted suggestion; insert requires a second activation (click/shortcut). */
+let selectedSuggestionIndex: number | null = null;
+let thinkingTimer: ReturnType<typeof setInterval> | null = null;
+let thinkingPhraseIndex = 0;
 
 let identityObserver: MutationObserver | null = null;
 let identityInterval: ReturnType<typeof setInterval> | null = null;
@@ -320,7 +338,8 @@ function setCurrentPost(brief: PostBrief): void {
   isReading = true;
   updateReadingIndicator();
 
-  if (!prev || prev.tweetId !== merged.tweetId) postOpenAt = now();
+  const tweetChanged = !prev || prev.tweetId !== merged.tweetId;
+  if (tweetChanged) postOpenAt = now();
 
   mediaDebug('post captured', {
     tweetId: merged.tweetId,
@@ -329,12 +348,34 @@ function setCurrentPost(brief: PostBrief): void {
     mediaUpgraded,
   });
 
-  if (!prev || prev.tweetId !== merged.tweetId || mediaUpgraded || repliesUpgraded) {
+  // New post: never leave the previous tweet's suggestions on the card.
+  if (tweetChanged) {
+    suggestions = [];
+    composeReady = false;
+    selectedSuggestionIndex = null;
+    lastRefinement = undefined;
+    if (chipVisible) hideRestoreChip();
+    if (cardVisible) {
+      clearError();
+      clearNudge();
+      renderSuggestions();
+      setRefinementsEnabled(false);
+      setLoading(true);
+    }
+  }
+
+  if (tweetChanged || mediaUpgraded || repliesUpgraded) {
     // Richer brief invalidates drafts built from thinner Stage 1 context.
-    if (prev?.tweetId === merged.tweetId && (mediaUpgraded || repliesUpgraded)) {
+    if (!tweetChanged && (mediaUpgraded || repliesUpgraded)) {
       suggestions = [];
       composeReady = false;
+      selectedSuggestionIndex = null;
       void clearCachedSuggestions(merged.tweetId);
+      if (cardVisible) {
+        renderSuggestions();
+        setRefinementsEnabled(false);
+        setLoading(true);
+      }
     }
     void prefetchComprehend(merged);
   }
@@ -601,6 +642,7 @@ async function composeSuggestions(refinement?: RefinementChip): Promise<void> {
       false,
     );
     setRefinementsEnabled(false);
+    setLoading(false);
     return;
   }
 
@@ -608,10 +650,17 @@ async function composeSuggestions(refinement?: RefinementChip): Promise<void> {
 
   clearError();
   clearNudge();
+  // Drop prior drafts immediately so a slow compose never shows another post's text.
+  suggestions = [];
+  composeReady = false;
+  selectedSuggestionIndex = null;
+  renderSuggestions();
+  setRefinementsEnabled(false);
   setLoading(true);
   isGenerating = true;
   lastRefinement = refinement;
   const composeStartedAt = now();
+  const composeTweetId = currentPost!.tweetId;
 
   try {
     const res = await sendExtensionMessage({
@@ -619,6 +668,9 @@ async function composeSuggestions(refinement?: RefinementChip): Promise<void> {
       postBrief: currentPost!,
       refinement,
     });
+
+    // User may have switched posts while this request was in flight.
+    if (currentPost?.tweetId !== composeTweetId) return;
 
     if (res.ok && res.suggestions?.length) {
       suggestions = res.suggestions;
@@ -637,6 +689,7 @@ async function composeSuggestions(refinement?: RefinementChip): Promise<void> {
       if (res.governor) updateBudgetDisplay(res.governor.remainingBudget);
       if (res.usageSummary) updateSpendDisplay(res.usageSummary.totalUsd);
       const nudges: string[] = [];
+      // Soft per-handle target-variety nudges are no longer emitted; budget + shape remain.
       if (res.governor?.nudge) nudges.push(res.governor.nudge);
       // F10: degraded Stage 1 must be visible, not silently reused.
       if (res.comprehend?.degraded) {
@@ -655,6 +708,7 @@ async function composeSuggestions(refinement?: RefinementChip): Promise<void> {
       void refreshGovernorStatus();
     }
   } catch (e) {
+    if (currentPost?.tweetId !== composeTweetId) return;
     composeReady = false;
     suggestions = [];
     renderSuggestions();
@@ -662,8 +716,14 @@ async function composeSuggestions(refinement?: RefinementChip): Promise<void> {
     const msg = e instanceof Error ? e.message : 'Could not reach extension background';
     showError(msg, true);
   } finally {
-    setLoading(false);
+    const stale = currentPost?.tweetId !== composeTweetId;
     isGenerating = false;
+    if (!stale) {
+      setLoading(false);
+    } else if (cardVisible && currentPost && !composeReady) {
+      // Finished for a previous tweet — kick compose for the one now on the card.
+      void composeSuggestions();
+    }
   }
 }
 
@@ -678,30 +738,33 @@ function createCard(): void {
   shadowRoot = cardHost.attachShadow({ mode: 'closed' });
 
   const wrapper = document.createElement('div');
-  wrapper.className = 'xrc-card xrc-hidden';
+  wrapper.className = 'xrc-root';
   wrapper.innerHTML = `
-    <div class="xrc-header">
-      <span class="xrc-reading" aria-live="polite">Reading this post</span>
-      <span class="xrc-budget" aria-live="polite" title="Daily reply budget remaining"></span>
-      <span class="xrc-spend" aria-live="polite" title="Estimated lifetime Gemini spend"></span>
-      <button class="xrc-close" aria-label="Dismiss">×</button>
+    <div class="xrc-card xrc-hidden">
+      <div class="xrc-header">
+        <span class="xrc-reading" aria-live="polite">Reading this post</span>
+        <span class="xrc-budget" aria-live="polite" title="Daily reply budget remaining"></span>
+        <span class="xrc-spend" aria-live="polite" title="Estimated lifetime Gemini spend"></span>
+        <button class="xrc-close" aria-label="Dismiss">×</button>
+      </div>
+      <div class="xrc-disclosure">This extension reads posts you view on X to suggest replies. Data goes directly to Gemini with your API key.</div>
+      <div class="xrc-loading xrc-hidden" aria-live="polite"><span class="xrc-loading-text">Thinking…</span></div>
+      <div class="xrc-error xrc-hidden" role="alert">
+        <span class="xrc-error-text"></span>
+        <button type="button" class="xrc-retry xrc-hidden">Retry</button>
+      </div>
+      <div class="xrc-nudge xrc-hidden"></div>
+      <div class="xrc-suggestions" role="listbox" aria-label="Reply suggestions"></div>
+      <div class="xrc-refinements">
+        <button data-refine="shorter" disabled>Shorter</button>
+        <button data-refine="sharper" disabled>Sharper</button>
+        <button data-refine="funnier" disabled>Funnier</button>
+        <button data-refine="less_agreeable" disabled>Less agreeable</button>
+        <button data-refine="add_question" disabled>Add question</button>
+      </div>
+      <div class="xrc-hint"></div>
     </div>
-    <div class="xrc-disclosure">This extension reads posts you view on X to suggest replies. Data goes directly to Gemini with your API key.</div>
-    <div class="xrc-loading xrc-hidden" aria-live="polite">Generating…</div>
-    <div class="xrc-error xrc-hidden" role="alert">
-      <span class="xrc-error-text"></span>
-      <button type="button" class="xrc-retry xrc-hidden">Retry</button>
-    </div>
-    <div class="xrc-nudge xrc-hidden"></div>
-    <div class="xrc-suggestions"></div>
-    <div class="xrc-refinements">
-      <button data-refine="shorter" disabled>Shorter</button>
-      <button data-refine="sharper" disabled>Sharper</button>
-      <button data-refine="funnier" disabled>Funnier</button>
-      <button data-refine="less_agreeable" disabled>Less agreeable</button>
-      <button data-refine="add_question" disabled>Add question</button>
-    </div>
-    <div class="xrc-hint"></div>
+    <button type="button" class="xrc-restore-chip xrc-hidden" aria-label="Show suggestions">Suggestions</button>
   `;
 
   updateHintText();
@@ -711,7 +774,7 @@ function createCard(): void {
   shadowRoot.appendChild(style);
   shadowRoot.appendChild(wrapper);
 
-  wrapper.querySelector('.xrc-close')?.addEventListener('click', hideCard);
+  wrapper.querySelector('.xrc-close')?.addEventListener('click', () => hideCard());
   wrapper.querySelector('.xrc-retry')?.addEventListener('click', () => {
     void composeSuggestions(lastRefinement);
   });
@@ -722,14 +785,17 @@ function createCard(): void {
       void composeSuggestions(chip);
     });
   });
+  wrapper.querySelector('.xrc-restore-chip')?.addEventListener('click', () => {
+    expandFromChip();
+  });
 
   cardHost.style.pointerEvents = 'auto';
 }
 
 function getInlineStyles(): string {
   return `
-    .xrc-card { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #15202b; color: #e7e9ea; border: 1px solid #38444d; border-radius: 16px;
+    .xrc-root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .xrc-card { background: #15202b; color: #e7e9ea; border: 1px solid #38444d; border-radius: 16px;
       padding: 12px 14px; width: 360px; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
     .xrc-hidden { display: none !important; }
     .xrc-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -742,8 +808,10 @@ function getInlineStyles(): string {
     .xrc-close { background: none; border: none; color: #71767b; font-size: 20px; cursor: pointer; }
     .xrc-disclosure { font-size: 11px; color: #71767b; margin-bottom: 10px; line-height: 1.4; }
     .xrc-suggestion { padding: 10px 12px; margin-bottom: 8px; background: #192734; border-radius: 12px;
-      cursor: pointer; border: 1px solid transparent; transition: border-color .15s; }
+      cursor: pointer; border: 1px solid transparent; transition: border-color .15s, background .15s;
+      user-select: none; }
     .xrc-suggestion:hover { border-color: #1d9bf0; }
+    .xrc-suggestion.xrc-selected { border-color: #1d9bf0; background: #1e2732; box-shadow: inset 0 0 0 1px #1d9bf0; }
     .xrc-suggestion.xrc-inserted { border-color: #00ba7c; background: #1a2e28; }
     .xrc-intent { font-size: 10px; text-transform: uppercase; color: #1d9bf0; font-weight: 700; margin-bottom: 4px; }
     .xrc-text { font-size: 14px; line-height: 1.4; }
@@ -754,12 +822,19 @@ function getInlineStyles(): string {
     .xrc-refinements button:disabled { opacity: 0.4; cursor: not-allowed; }
     .xrc-hint { font-size: 11px; color: #71767b; margin-top: 8px; }
     .xrc-loading, .xrc-error, .xrc-nudge { font-size: 13px; margin-bottom: 8px; }
+    .xrc-loading { color: #e7e9ea; min-height: 1.4em; }
+    .xrc-loading-text { display: inline-block; transition: opacity .25s ease; }
+    .xrc-loading-text.xrc-loading-fade { opacity: 0; }
     .xrc-error { color: #f4212e; line-height: 1.4; }
     .xrc-error-text { display: block; margin-bottom: 6px; }
     .xrc-retry { font-size: 11px; padding: 4px 12px; border-radius: 999px;
       border: 1px solid #f4212e; background: transparent; color: #f4212e; cursor: pointer; }
     .xrc-retry:hover { background: rgba(244,33,46,.12); }
     .xrc-nudge { color: #ffad1f; }
+    .xrc-restore-chip { font: 600 12px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #15202b; color: #e7e9ea; border: 1px solid #38444d; border-radius: 999px;
+      padding: 8px 14px; cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
+    .xrc-restore-chip:hover { border-color: #1d9bf0; color: #1d9bf0; }
   `;
 }
 
@@ -785,6 +860,7 @@ function positionCard(): void {
 
 async function showCard(): Promise<void> {
   createCard();
+  hideRestoreChip();
   const card = shadowRoot?.querySelector('.xrc-card');
   card?.classList.remove('xrc-hidden');
   cardVisible = true;
@@ -801,6 +877,13 @@ async function showCard(): Promise<void> {
     return;
   }
 
+  // No ready drafts — never leave a previous render; show thinking immediately.
+  suggestions = [];
+  selectedSuggestionIndex = null;
+  renderSuggestions();
+  setRefinementsEnabled(false);
+  setLoading(true);
+
   // Prefetch still running for this tweet — show generating and await; do not double-compose.
   const inflightPrefetch = composePrefetch;
   if (
@@ -808,8 +891,9 @@ async function showCard(): Promise<void> {
     inflightPrefetch?.tweetId === currentPost.tweetId &&
     !isGenerating
   ) {
-    setLoading(true);
+    const awaitedId = currentPost.tweetId;
     const ok = await inflightPrefetch.promise;
+    if (currentPost?.tweetId !== awaitedId) return;
     if (ok && composeReady && suggestions.length > 0) {
       renderSuggestions();
       setRefinementsEnabled(true);
@@ -835,8 +919,67 @@ function hideCard(): void {
   cardVisible = false;
 }
 
+function showRestoreChip(): void {
+  createCard();
+  const chip = shadowRoot?.querySelector('.xrc-restore-chip') as HTMLElement | null;
+  if (!chip) return;
+  chip.classList.remove('xrc-hidden');
+  chipVisible = true;
+  positionCard();
+}
+
+function hideRestoreChip(): void {
+  shadowRoot?.querySelector('.xrc-restore-chip')?.classList.add('xrc-hidden');
+  chipVisible = false;
+}
+
+/** After successful insert: hide the full card; leave a small restore chip. */
+function collapseToChip(): void {
+  hideCard();
+  showRestoreChip();
+}
+
+function expandFromChip(): void {
+  hideRestoreChip();
+  void showCard();
+}
+
+function stopThinkingAnimation(): void {
+  if (thinkingTimer) {
+    clearInterval(thinkingTimer);
+    thinkingTimer = null;
+  }
+}
+
 function setLoading(loading: boolean): void {
-  shadowRoot?.querySelector('.xrc-loading')?.classList.toggle('xrc-hidden', !loading);
+  const el = shadowRoot?.querySelector('.xrc-loading') as HTMLElement | null;
+  const textEl = shadowRoot?.querySelector('.xrc-loading-text') as HTMLElement | null;
+  if (!el) return;
+
+  if (!loading) {
+    stopThinkingAnimation();
+    el.classList.add('xrc-hidden');
+    return;
+  }
+
+  thinkingPhraseIndex = 0;
+  if (textEl) {
+    textEl.classList.remove('xrc-loading-fade');
+    textEl.textContent = THINKING_PHRASES[0];
+  }
+  el.classList.remove('xrc-hidden');
+
+  stopThinkingAnimation();
+  thinkingTimer = setInterval(() => {
+    const label = shadowRoot?.querySelector('.xrc-loading-text') as HTMLElement | null;
+    if (!label) return;
+    thinkingPhraseIndex = (thinkingPhraseIndex + 1) % THINKING_PHRASES.length;
+    label.classList.add('xrc-loading-fade');
+    window.setTimeout(() => {
+      label.textContent = THINKING_PHRASES[thinkingPhraseIndex];
+      label.classList.remove('xrc-loading-fade');
+    }, 220);
+  }, THINKING_ROTATE_MS);
 }
 
 function clearError(): void {
@@ -931,8 +1074,18 @@ function updateReadingIndicator(): void {
 function updateHintText(): void {
   const hint = shadowRoot?.querySelector('.xrc-hint');
   if (hint) {
-    hint.textContent = `${getModifierLabel()}1/2/3 to insert · Click to insert`;
+    const mod = getModifierLabel();
+    hint.textContent = `Click or ${mod}1/2/3 to select · press again / double-click to insert`;
   }
+}
+
+function applySuggestionSelection(): void {
+  shadowRoot?.querySelectorAll('.xrc-suggestion').forEach((el) => {
+    const idx = Number((el as HTMLElement).dataset.index);
+    const selected = selectedSuggestionIndex === idx;
+    el.classList.toggle('xrc-selected', selected);
+    el.setAttribute('aria-selected', selected ? 'true' : 'false');
+  });
 }
 
 function renderSuggestions(): void {
@@ -946,10 +1099,20 @@ function renderSuggestions(): void {
     const div = document.createElement('div');
     div.className = 'xrc-suggestion';
     div.dataset.index = String(i);
+    div.setAttribute('role', 'option');
+    div.setAttribute('aria-selected', 'false');
     div.innerHTML = `<div class="xrc-intent">${s.intent} · ${mod}${i + 1}</div><div class="xrc-text">${escapeHtml(s.text)}</div>`;
-    div.addEventListener('click', () => selectSuggestion(i, true));
+    // Single click = select only; double-click = insert + collapse (I1: text insert, never Post).
+    div.addEventListener('click', () => {
+      void activateSuggestion(i, 'select');
+    });
+    div.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      void activateSuggestion(i, 'insert');
+    });
     container.appendChild(div);
   });
+  applySuggestionSelection();
 }
 
 function escapeHtml(text: string): string {
@@ -963,10 +1126,29 @@ function flashSuggestionItem(index: number): void {
   setTimeout(() => item.classList.remove('xrc-inserted'), 1200);
 }
 
-async function selectSuggestion(index: number, insert: boolean): Promise<void> {
+/**
+ * Select vs insert. First activation highlights; second activation (same index via
+ * shortcut, or double-click) inserts into the composer and collapses to the chip.
+ */
+async function activateSuggestion(
+  index: number,
+  mode: 'select' | 'insert' | 'toggle',
+): Promise<void> {
   const s = suggestions[index];
   if (!s || !currentPost) return;
-  if (insert && isInserting) return;
+
+  const shouldInsert =
+    mode === 'insert' || (mode === 'toggle' && selectedSuggestionIndex === index);
+
+  if (!shouldInsert) {
+    selectedSuggestionIndex = index;
+    applySuggestionSelection();
+    return;
+  }
+
+  if (isInserting) return;
+  selectedSuggestionIndex = index;
+  applySuggestionSelection();
 
   // F3: this write used to be `void`-ed, so the access-level rejection was invisible and
   // `served:<tweetId>` silently never existed. The worker now grants content scripts access
@@ -975,40 +1157,40 @@ async function selectSuggestion(index: number, insert: boolean): Promise<void> {
     console.warn('[XRC] could not record the served suggestion', e),
   );
 
-  if (insert) {
-    isInserting = true;
-    try {
-      focusComposer();
-      const result = await insertIntoComposer(s.text);
+  isInserting = true;
+  try {
+    focusComposer();
+    const result = await insertIntoComposer(s.text);
 
-      if (result.success) {
-        flashSuggestionItem(index);
-        showActionToast('Inserted');
-        // Clipboard is a manual-paste fallback only — do not re-insert.
-        void copyToClipboard(s.text);
-        return;
-      }
-
-      const copied = await copyToClipboard(s.text);
+    if (result.success) {
       flashSuggestionItem(index);
-      showActionToast(
-        copied
-          ? `Copied — paste manually (${getPasteShortcutLabel()})`
-          : 'Could not insert — try clicking the composer first',
-      );
-    } finally {
-      isInserting = false;
+      showActionToast('Inserted');
+      // Clipboard is a manual-paste fallback only — do not re-insert.
+      void copyToClipboard(s.text);
+      collapseToChip();
+      return;
     }
-    return;
-  }
 
-  const copied = await copyToClipboard(s.text);
-  showActionToast(copied ? 'Copied' : 'Copy failed');
+    const copied = await copyToClipboard(s.text);
+    flashSuggestionItem(index);
+    showActionToast(
+      copied
+        ? `Copied — paste manually (${getPasteShortcutLabel()})`
+        : 'Could not insert — try clicking the composer first',
+    );
+  } finally {
+    isInserting = false;
+  }
 }
 
 function setupComposerWatchers(ctx: InstanceType<typeof ContentScriptContext>): void {
   const checkFocus = () => {
     if (isComposerFocused()) {
+      // After insert the chip is intentional — don't immediately re-open the full card.
+      if (chipVisible) {
+        positionCard();
+        return;
+      }
       if (!cardVisible) void showCard();
       else positionCard();
     }
@@ -1016,15 +1198,22 @@ function setupComposerWatchers(ctx: InstanceType<typeof ContentScriptContext>): 
 
   ctx.addEventListener(document, 'focusin', checkFocus, { capture: true });
   ctx.addEventListener(window, 'scroll', () => {
-    if (cardVisible) schedulePositionCard();
+    if (cardVisible || chipVisible) schedulePositionCard();
   }, { capture: true });
 
   ctx.addEventListener(document, 'keydown', (e) => {
     const ke = e as KeyboardEvent;
-    if (ke.key === 'Escape' && cardVisible) {
-      ke.preventDefault();
-      hideCard();
-      return;
+    if (ke.key === 'Escape') {
+      if (cardVisible) {
+        ke.preventDefault();
+        hideCard();
+        return;
+      }
+      if (chipVisible) {
+        ke.preventDefault();
+        hideRestoreChip();
+        return;
+      }
     }
 
     if (!cardVisible || !isShortcutModifier(ke)) return;
@@ -1033,7 +1222,8 @@ function setupComposerWatchers(ctx: InstanceType<typeof ContentScriptContext>): 
     if (key === '1' || key === '2' || key === '3') {
       ke.preventDefault();
       ke.stopPropagation();
-      void selectSuggestion(Number(key) - 1, true);
+      // First press selects; second press of the same number inserts + collapses.
+      void activateSuggestion(Number(key) - 1, 'toggle');
     }
   }, { capture: true });
 }
@@ -1150,10 +1340,13 @@ export default defineContentScript({
         isReading = false;
         suggestions = [];
         composeReady = false;
+        selectedSuggestionIndex = null;
         lastRefinement = undefined;
         postOpenAt = null;
         composePrefetch = null;
+        stopThinkingAnimation();
         hideCard();
+        hideRestoreChip();
       }
       if (!keepClickClock) {
         replyClickAt = null;

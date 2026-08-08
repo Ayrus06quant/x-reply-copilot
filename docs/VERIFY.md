@@ -147,9 +147,9 @@ Empirical checks from plan section 8. **Do not automate these against live x.com
 1. Set daily budget to 5 in Options
 2. Generate 5 suggestions across different posts
 3. Verify warning appears on 6th attempt
-4. Reply to same account 4+ times — verify nudge message
+4. Reply to the same account repeatedly — no "varying your targets" nudge (by design)
 
-**Pass criteria:** Hard budget enforced; per-account nudge visible.
+**Pass criteria:** Hard daily budget enforced; per-handle target-variety nudge absent.
 
 ---
 

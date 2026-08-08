@@ -35,7 +35,6 @@ export async function getGovernorStatus(targetHandle: string): Promise<GovernorS
   const settings = await getSettings();
   const state = await loadState();
   const budget = settings.dailyReplyBudget;
-  const threshold = settings.accountNudgeThreshold;
   const accountKey = targetHandle.toLowerCase();
   const accountCount = state.accountCounts[accountKey] ?? 0;
   const remaining = Math.max(0, budget - state.replyCount);
@@ -45,11 +44,12 @@ export async function getGovernorStatus(targetHandle: string): Promise<GovernorS
     accountReplyCount: accountCount,
   };
 
+  // Hard daily budget only. Per-handle soft nudges ("Consider varying your targets")
+  // were removed — the user may reply to the same account as often as they want.
+  // `accountReplyCount` (and settings.accountNudgeThreshold) remain for counters/storage.
   if (remaining <= 0) {
     status.blocked = true;
     status.nudge = `Daily reply budget (${budget}) reached. Take a break to avoid pattern detection.`;
-  } else if (accountCount >= threshold) {
-    status.nudge = `You've replied to @${targetHandle} ${accountCount} times today. Consider varying your targets.`;
   }
 
   return status;
